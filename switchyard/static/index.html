@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Switchyard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2315803d'/%3E%3Cpath d='M8 23 L16 9 L24 23' stroke='white' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#f6f5f2; --panel:#ffffff; --ink:#1c1b19; --ink-2:#5f5c55; --ink-3:#8f8b82; --line:#e6e3dc; --line-2:#efede8;
+  --accent:#15803d; --accent-soft:#e7f4ec; --amber:#b45309; --amber-soft:#fdf1e2; --red:#b91c1c; --red-soft:#fbe9e9;
+  --idle:#a8a49b; --idle-soft:#f0eee9; --shadow:0 1px 2px rgba(28,27,25,.05),0 1px 1px rgba(28,27,25,.03);
+  --r:12px; --mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+  --sans:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#121211; --panel:#1b1b19; --ink:#ecebe7; --ink-2:#a9a69e; --ink-3:#77746d; --line:#2b2a27; --line-2:#232220;
+  --accent:#4ade80; --accent-soft:#16301f; --amber:#f59e0b; --amber-soft:#33260f; --red:#f87171; --red-soft:#3a1a1a;
+  --idle:#6d6a63; --idle-soft:#252422; --shadow:none;
+}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 var(--sans);font-feature-settings:"tnum" 1,"cv11" 1}
+.wrap{max-width:1120px;margin:0 auto;padding:28px 20px 60px}
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px}
+.brand{display:flex;align-items:center;gap:12px}
+.mark{width:34px;height:34px;border-radius:9px;background:var(--accent);display:grid;place-items:center}
+.mark svg{width:18px;height:18px}
+h1{font-size:18px;margin:0;letter-spacing:-.01em;font-weight:650}
+.sub{color:var(--ink-3);font-size:12.5px;margin-top:1px}
+.meta{display:flex;align-items:center;gap:14px;color:var(--ink-3);font-size:12.5px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);display:inline-block;margin-right:6px;vertical-align:1px}
+.dot.off{background:var(--red);box-shadow:0 0 0 3px var(--red-soft)}
+.banner{display:none;align-items:center;justify-content:space-between;gap:12px;background:var(--amber-soft);color:var(--amber);border-radius:var(--r);padding:10px 14px;margin-bottom:16px;font-size:13px}
+.banner.show{display:flex}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
+.sec-t{font-size:11.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3);margin:26px 2px 10px}
+/* GPU hero */
+.gpu{padding:18px 20px}
+.gpu-top{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap}
+.gpu-name{font-weight:600;font-size:15px}
+.gpu-owner{color:var(--ink-2);font-size:13px;margin-top:2px}
+.gpu-owner b{color:var(--ink);font-weight:600}
+.vram{font-family:var(--mono);font-size:12.5px;color:var(--ink-2)}
+.bar{height:8px;border-radius:99px;background:var(--line-2);margin:12px 0 6px;overflow:hidden}
+.bar>i{display:block;height:100%;width:0;background:var(--accent);border-radius:99px;transition:width .6s cubic-bezier(.2,.8,.2,1)}
+.lanes{border-top:1px solid var(--line);margin-top:16px}
+.lane{display:grid;grid-template-columns:minmax(150px,1.1fr) 2.4fr 160px;gap:16px;align-items:center;padding:13px 0;border-bottom:1px solid var(--line-2)}
+.lane:last-child{border-bottom:0;padding-bottom:0}
+.lane-name{font-weight:600;display:flex;align-items:center;gap:8px}
+.lane-sub{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);margin-top:2px}
+.chip{font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:99px;background:var(--idle-soft);color:var(--ink-2);text-transform:capitalize}
+.chip.awake,.chip.ready,.chip.up,.chip.owner{background:var(--accent-soft);color:var(--accent)}
+.chip.loading{background:var(--amber-soft);color:var(--amber)}
+.chip.down,.chip.error{background:var(--red-soft);color:var(--red)}
+.stats{display:flex;gap:22px;flex-wrap:wrap}
+.stat{min-width:64px}
+.stat .k{font-size:11px;color:var(--ink-3)}
+.stat .v{font-family:var(--mono);font-size:13px}
+.acts{display:flex;gap:6px;justify-content:flex-end}
+button{font:inherit;font-size:12.5px;font-weight:550;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:6px 11px;border-radius:8px;cursor:pointer;transition:background .15s,border-color .15s,transform .1s}
+button:hover{background:var(--line-2)}
+button:active{transform:scale(.97)}
+button:disabled{opacity:.45;cursor:default;transform:none}
+button.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+button.primary:hover{opacity:.9}
+button.warn{color:var(--amber);border-color:currentColor;background:transparent}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.card{padding:16px 18px}
+.card-h{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}
+.card-h h3{margin:0;font-size:14px;font-weight:600}
+.card-h .lane-sub{margin:0}
+.models{list-style:none;padding:0;margin:12px 0 0;display:grid;gap:6px}
+.models li{display:flex;justify-content:space-between;font-family:var(--mono);font-size:12px;color:var(--ink-2)}
+.kv{font-family:var(--mono);font-size:12px;color:var(--ink-2);word-break:break-all;margin-top:10px}
+/* settings */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);padding:0 14px}
+.tab{background:none;border:0;border-bottom:2px solid transparent;border-radius:0;padding:12px 10px 10px;color:var(--ink-3);font-weight:550}
+.tab:hover{background:none;color:var(--ink)}
+.tab.on{color:var(--ink);border-bottom-color:var(--ink)}
+.fields{padding:6px 18px 4px}
+.f{display:grid;grid-template-columns:minmax(180px,1fr) 1.4fr;gap:18px;padding:13px 0;border-bottom:1px solid var(--line-2);align-items:start}
+.f:last-child{border-bottom:0}
+.f label{font-weight:550;display:flex;gap:8px;align-items:center}
+.tag{font-size:10.5px;font-weight:600;color:var(--ink-3);border:1px solid var(--line);border-radius:5px;padding:0 5px}
+.tag.live{color:var(--accent);border-color:var(--accent-soft);background:var(--accent-soft)}
+.help{color:var(--ink-3);font-size:12px;margin-top:3px}
+input[type=text],input[type=number]{width:100%;font:inherit;font-size:13px;font-family:var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 9px;outline:none;transition:border-color .15s,box-shadow .15s}
+input:focus{border-color:var(--ink-3);box-shadow:0 0 0 3px var(--line-2)}
+input.dirty{border-color:var(--amber)}
+.switch{position:relative;width:38px;height:22px;display:inline-block}
+.switch input{opacity:0;width:0;height:0}
+.switch span{position:absolute;inset:0;background:var(--line);border-radius:99px;transition:background .2s;cursor:pointer}
+.switch span:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:transform .2s cubic-bezier(.2,.8,.2,1);box-shadow:0 1px 2px rgba(0,0,0,.2)}
+.switch input:checked+span{background:var(--accent)}
+.switch input:checked+span:before{transform:translateX(16px)}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0;padding:6px 14px}
+.seg button.on{background:var(--ink);color:var(--bg)}
+.etable{width:100%;border-collapse:collapse;font-size:12px}
+.etable th{text-align:left;font-weight:550;color:var(--ink-3);padding:0 4px 6px}
+.etable td{padding:3px 4px}
+.etable button{padding:4px 8px}
+.save{display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:12px 18px;border-top:1px solid var(--line)}
+.save .msg{color:var(--ink-3);font-size:12.5px;margin-right:auto}
+/* log */
+.log{font-family:var(--mono);font-size:12px;max-height:300px;overflow:auto;padding:10px 0}
+.log div{display:grid;grid-template-columns:70px 78px 1fr;gap:10px;padding:2px 18px}
+.log .t{color:var(--ink-3)}
+.log .c{color:var(--ink-2)}
+.log .warn .m{color:var(--amber)} .log .error .m{color:var(--red)}
+.empty{color:var(--ink-3);font-size:13px;padding:14px 0 2px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translate(-50%,20px);opacity:0;background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:10px;font-size:13px;transition:all .25s cubic-bezier(.2,.8,.2,1);pointer-events:none}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+@media (max-width:760px){
+  .grid2{grid-template-columns:1fr}
+  .lane{grid-template-columns:1fr;gap:10px}
+  .acts{justify-content:flex-start}
+  .f{grid-template-columns:1fr;gap:8px}
+  .log div{grid-template-columns:62px 1fr}.log .c{display:none}
+  .meta .hide-sm{display:none}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <div class="mark"><svg viewBox="0 0 18 18" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"><path d="M3 15 9 3l6 12"/><path d="M5.5 10h7"/></svg></div>
+      <div><h1>Switchyard</h1><div class="sub">GPU arbiter · OVMS shim · speech to text</div></div>
+    </div>
+    <div class="meta"><span class="hide-sm" id="ver"></span><span id="up"></span><span><i class="dot" id="conn"></i><span id="connt">live</span></span></div>
+  </header>
+
+  <div class="banner" id="banner"><span id="bannert">Some changes take effect after a restart.</span><button class="warn" id="restart">Restart now</button></div>
+
+  <div class="panel gpu" id="gpu">
+    <div class="gpu-top">
+      <div><div class="gpu-name" id="gname">GPU</div><div class="gpu-owner" id="gowner">Waiting for status…</div></div>
+      <div class="vram" id="gvram"></div>
+    </div>
+    <div class="bar"><i id="gbar"></i></div>
+    <div class="lanes" id="lanes"></div>
+  </div>
+
+  <div class="sec-t">Services</div>
+  <div class="grid2">
+    <div class="panel card" id="ovms"></div>
+    <div class="panel card" id="stt"></div>
+  </div>
+
+  <div class="sec-t">Settings</div>
+  <div class="panel">
+    <div class="tabs" id="tabs"></div>
+    <div class="fields" id="fields"></div>
+    <div class="save"><span class="msg" id="savemsg">No unsaved changes</span><button id="discard" disabled>Discard</button><button class="primary" id="save" disabled>Save</button></div>
+  </div>
+
+  <div class="sec-t">Activity</div>
+  <div class="panel"><div class="log" id="log"></div></div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmtDur = s => s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s/60)}m ${s%60}s` : `${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`;
+const n = v => v == null ? "—" : Number.isInteger(v) ? v.toLocaleString() : (+v).toFixed(1);
+
+function toast(msg){const t=$("#toast");t.textContent=msg;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),2200)}
+async function api(path, body){
+  const r = await fetch(path, body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+async function act(component, action, target){
+  try{ await api("/api/action", {component, action, target}); toast(`${action.replace("_"," ")} ${target||component}: started`); }
+  catch(e){ toast(e.message); }
+}
+
+/* ---------- status ---------- */
+function stat(k, v){ return `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`; }
+function renderStatus(s){
+  $("#ver").textContent = "v" + s.version;
+  $("#up").textContent = "up " + fmtDur(s.uptime);
+  const pend = s.restart_pending || [];
+  $("#banner").classList.toggle("show", pend.length > 0);
+  $("#bannert").textContent = `Restart to apply: ${pend.join(", ")}`;
+
+  const a = s.arbiter;
+  if(!a){ $("#gowner").textContent = "GPU arbiter is disabled"; $("#lanes").innerHTML = ""; }
+  else{
+    const g = a.gpu || {};
+    $("#gname").textContent = g.name || "GPU";
+    const owner = a.owner === "comfy" ? "ComfyUI" : a.owner;
+    $("#gowner").innerHTML = owner ? `Held by <b>${esc(owner)}</b>` : "Idle — every engine asleep";
+    if(g.total_mb){
+      const used = g.total_mb - g.free_mb;
+      $("#gvram").textContent = `${(used/1024).toFixed(1)} / ${(g.total_mb/1024).toFixed(1)} GiB`;
+      $("#gbar").style.width = (100*used/g.total_mb).toFixed(1) + "%";
+    } else { $("#gvram").textContent = "VRAM unknown (ComfyUI down?)"; $("#gbar").style.width = "0"; }
+
+    let html = "";
+    for(const [name, e] of Object.entries(a.engines)){
+      const isOwner = a.owner === name;
+      const left = e.state === "awake" && isOwner && !e.inflight ? Math.max(0, a.idle_sleep_sec - e.idle_sec) : null;
+      html += `<div class="lane">
+        <div><div class="lane-name">${esc(name)} <span class="chip ${e.state}">${e.state}</span></div>
+          <div class="lane-sub">:${e.listen} → ${esc(e.backend)}${e.text_only ? " · text-only" : ""}</div></div>
+        <div class="stats">${stat("in flight", e.inflight)}${stat("requests", n(e.requests||0))}${stat("wakes", n(e.wakes||0))}${stat("last wake", e.last_wake_sec ? e.last_wake_sec+"s" : "—")}${stat("sleeps in", left == null ? "—" : fmtDur(left))}${e.errors ? stat("errors", n(e.errors)) : ""}</div>
+        <div class="acts"><button data-a="warm" data-t="${esc(name)}" ${e.state==="awake"&&isOwner?"disabled":""}>Wake</button><button data-a="sleep" data-t="${esc(name)}" ${e.state!=="awake"||e.inflight?"disabled":""}>Sleep</button></div>
+      </div>`;
+    }
+    const q = a.comfy_queue || {};
+    const cstate = q.running == null ? "down" : a.owner === "comfy" ? "owner" : "idle";
+    html += `<div class="lane">
+      <div><div class="lane-name">ComfyUI <span class="chip ${cstate}">${cstate === "owner" ? "holds GPU" : cstate}</span></div><div class="lane-sub">image &amp; video jobs</div></div>
+      <div class="stats">${stat("running", n(q.running))}${stat("queued", n(q.pending))}${stat("claims", a.comfy_active)}</div>
+      <div class="acts"><button data-a="comfy_unload" ${a.comfy_active?"disabled":""} title="Drop ComfyUI's models from VRAM">Unload</button><button data-a="comfy_release" ${a.comfy_active?"":"disabled"} title="Clear a stuck claim">Release</button></div>
+    </div>`;
+    $("#lanes").innerHTML = html;
+  }
+
+  const o = s.ovms;
+  $("#ovms").innerHTML = !o ? `<div class="card-h"><h3>OVMS shim</h3><span class="chip">disabled</span></div>` :
+    `<div class="card-h"><div><h3>OVMS shim</h3><div class="lane-sub">:${o.port} → ${esc(o.upstream)}</div></div><span class="chip ${o.up?"up":o.up===false?"down":""}">${o.up?"up":o.up===false?"down":"…"}</span></div>
+     <div class="stats">${stat("chat", n(o.requests||0))}${stat("embeddings", n(o.embeddings||0))}${stat("reranks", n(o.reranks||0))}${stat("errors", n(o.errors||0))}</div>
+     <ul class="models">${(o.models||[]).map(m=>`<li><span>${esc(m.name)}</span><span>${esc(m.state.toLowerCase())}</span></li>`).join("") || '<li><span>no models reported</span></li>'}</ul>`;
+
+  const t = s.stt;
+  $("#stt").innerHTML = !t ? `<div class="card-h"><h3>Speech to text</h3><span class="chip">disabled</span></div>` :
+    `<div class="card-h"><div><h3>Speech to text</h3><div class="lane-sub">:${t.port} · CPU</div></div><span class="chip ${t.state==="ready"?"ready":t.state}">${esc(t.state)}</span></div>
+     <div class="stats">${stat("requests", n(t.requests||0))}${stat("audio", fmtDur(Math.round(t.audio_sec||0)))}${stat("speed", t.last_rtf ? t.last_rtf+"× rt" : "—")}${stat("errors", n(t.errors||0))}</div>
+     <div class="kv">${esc(t.error || t.model || "")}</div>
+     <div class="acts" style="justify-content:flex-start;margin-top:12px"><button data-c="stt" data-a="reload" ${t.state==="loading"?"disabled":""}>Reload model</button></div>`;
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest("button[data-a]"); if(!b) return;
+  b.disabled = true; act(b.dataset.c || "arbiter", b.dataset.a, b.dataset.t);
+});
+
+let alive = true;
+async function pollStatus(){
+  try{ renderStatus(await api("/api/status")); setConn(true); }
+  catch(e){ setConn(false); }
+  setTimeout(pollStatus, 2000);
+}
+function setConn(ok){ alive = ok; $("#conn").classList.toggle("off", !ok); $("#connt").textContent = ok ? "live" : "offline"; }
+
+/* ---------- settings ---------- */
+let schema = null, draft = {}, tab = null;
+async function loadSettings(){
+  schema = await api("/api/settings"); draft = {};
+  tab = tab || Object.keys(schema.groups)[0];
+  renderTabs(); renderFields(); updateSave();
+}
+function renderTabs(){
+  $("#tabs").innerHTML = Object.entries(schema.groups).map(([k,v]) => `<button class="tab ${k===tab?"on":""}" data-tab="${k}">${esc(v)}</button>`).join("");
+}
+$("#tabs").addEventListener("click", e => { const b = e.target.closest("[data-tab]"); if(b){ tab = b.dataset.tab; renderTabs(); renderFields(); } });
+const val = k => k in draft ? draft[k] : schema.values[k];
+function setDraft(k, v){
+  if(JSON.stringify(v) === JSON.stringify(schema.values[k])) delete draft[k]; else draft[k] = v;
+  updateSave();
+}
+function renderFields(){
+  const html = schema.fields.filter(f => f.group === tab).map(f => {
+    const v = val(f.key), dirty = f.key in draft ? "dirty" : "";
+    let input;
+    if(f.type === "bool") input = `<label class="switch"><input type="checkbox" data-k="${f.key}" ${v?"checked":""}><span></span></label>`;
+    else if(f.type === "choice") input = `<div class="seg">${f.choices.map(c=>`<button data-k="${f.key}" data-v="${c}" class="${c==v?"on":""}">${c}</button>`).join("")}</div>`;
+    else if(f.type === "engines") input = enginesTable(f.key, v);
+    else input = `<input class="${dirty}" type="${f.type==="str"?"text":"number"}" ${f.type==="float"?'step="any"':""} ${f.min!=null?`min="${f.min}"`:""} ${f.max!=null?`max="${f.max}"`:""} data-k="${f.key}" value="${esc(v)}">`;
+    return `<div class="f"><div><label>${esc(f.label)} <span class="tag ${f.live?"live":""}">${f.live?"live":"restart"}</span></label>${f.help?`<div class="help">${esc(f.help)}</div>`:""}</div><div>${input}</div></div>`;
+  }).join("");
+  $("#fields").innerHTML = html;
+}
+function enginesTable(key, list){
+  const rows = list.map((e,i) => `<tr>
+    <td><input type="text" data-ek="${key}" data-i="${i}" data-f="name" value="${esc(e.name)}"></td>
+    <td><input type="text" data-ek="${key}" data-i="${i}" data-f="backend" value="${esc(e.backend)}"></td>
+    <td><input type="number" data-ek="${key}" data-i="${i}" data-f="listen" value="${e.listen}"></td>
+    <td><input type="number" data-ek="${key}" data-i="${i}" data-f="free_mb" value="${e.free_mb}"></td>
+    <td><button data-erm="${i}" title="Remove">✕</button></td></tr>`).join("");
+  return `<table class="etable"><tr><th>Name</th><th>Backend</th><th>Listen</th><th>Free MiB to wake</th><th></th></tr>${rows}</table>
+    <div style="margin-top:8px"><button data-eadd="${key}">Add engine</button></div>`;
+}
+$("#fields").addEventListener("input", e => {
+  const t = e.target;
+  if(t.dataset.k){
+    const f = schema.fields.find(x => x.key === t.dataset.k);
+    let v = t.type === "checkbox" ? t.checked : t.value;
+    if(f.type === "int") v = v === "" ? v : parseInt(v, 10);
+    if(f.type === "float") v = v === "" ? v : parseFloat(v);
+    setDraft(f.key, v); t.classList.toggle("dirty", f.key in draft);
+  } else if(t.dataset.ek){
+    const list = JSON.parse(JSON.stringify(val(t.dataset.ek)));
+    const fld = t.dataset.f; list[+t.dataset.i][fld] = (fld === "listen" || fld === "free_mb") ? parseInt(t.value||"0",10) : t.value;
+    setDraft(t.dataset.ek, list); t.classList.add("dirty");
+  }
+});
+$("#fields").addEventListener("click", e => {
+  const b = e.target.closest("button"); if(!b) return;
+  if(b.dataset.k){ setDraft(b.dataset.k, +b.dataset.v); renderFields(); }
+  else if(b.dataset.eadd){ const k=b.dataset.eadd, list=JSON.parse(JSON.stringify(val(k))); list.push({name:"engine"+(list.length+1),backend:"127.0.0.1:8004",listen:8006,free_mb:16000}); setDraft(k,list); renderFields(); }
+  else if(b.dataset.erm != null){ const list=JSON.parse(JSON.stringify(val("engines"))); list.splice(+b.dataset.erm,1); setDraft("engines",list); renderFields(); }
+});
+function updateSave(){
+  const c = Object.keys(draft).length;
+  $("#save").disabled = $("#discard").disabled = !c;
+  $("#savemsg").textContent = c ? `${c} unsaved change${c>1?"s":""}` : "No unsaved changes";
+}
+$("#discard").onclick = () => { draft = {}; renderFields(); updateSave(); };
+$("#save").onclick = async () => {
+  try{
+    const r = await api("/api/settings", draft);
+    toast(r.restart_pending.length ? "Saved — restart to apply some changes" : "Saved");
+    await loadSettings();
+  }catch(e){ toast(e.message); }
+};
+$("#restart").onclick = async () => {
+  $("#restart").disabled = true;
+  try{ await api("/api/restart", {}); }catch(e){}
+  toast("Restarting…");
+  const wait = async () => { try{ await api("/api/status"); location.reload(); }catch(e){ setTimeout(wait, 1500); } };
+  setTimeout(wait, 2500);
+};
+
+/* ---------- log ---------- */
+let lastLog = 0;
+async function pollLog(){
+  try{
+    const items = await api("/api/logs?since=" + lastLog);
+    if(items.length){
+      const box = $("#log"), atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
+      for(const it of items){
+        const d = document.createElement("div"); d.className = it.level;
+        d.innerHTML = `<span class="t">${new Date(it.t*1000).toLocaleTimeString([], {hour12:false})}</span><span class="c">${esc(it.c)}</span><span class="m">${esc(it.msg)}</span>`;
+        box.appendChild(d); lastLog = it.id;
+      }
+      while(box.children.length > 400) box.firstChild.remove();
+      if(atBottom) box.scrollTop = box.scrollHeight;
+    }
+  }catch(e){}
+  setTimeout(pollLog, 2000);
+}
+
+pollStatus(); pollLog(); loadSettings().catch(e => $("#fields").innerHTML = `<div class="empty">${esc(e.message)}</div>`);
+</script>
+</body>
+</html>
