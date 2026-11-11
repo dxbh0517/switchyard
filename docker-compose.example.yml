@@ -1,0 +1,18 @@
+# Example stack wiring. Copy to docker-compose.yml and adjust hosts/ports/models.
+services:
+  switchyard:
+    build: .
+    # or: build: { context: ., args: { WITH_STT: "0" } }  # stdlib-only image
+    container_name: switchyard
+    restart: unless-stopped        # the dashboard's "Restart" button relies on this
+    network_mode: host             # reaches engines, ComfyUI and OVMS on localhost
+    volumes:
+      - ./models/granite-speech-5.0-470m-turboctc:/models/granite-speech-5.0-470m-turboctc:ro
+      - switchyard-data:/data      # settings saved from the dashboard
+    environment:
+      - ENGINES=qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500
+      - TEXT_ONLY_ENGINES=qwen
+      - COMFY_URL=http://127.0.0.1:8188
+      - OVMS_UPSTREAM=http://127.0.0.1:8010
+volumes:
+  switchyard-data:

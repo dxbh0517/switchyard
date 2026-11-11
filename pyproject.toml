@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "switchyard"
+version = "0.1.0"
+description = "Share one GPU between vLLM engines and ComfyUI, fix OVMS OpenAI API, serve CPU speech to text — one process with a dashboard."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "dxbh0517" }]
+keywords = [
+  "vllm",
+  "comfyui",
+  "gpu",
+  "openvino",
+  "speech-to-text",
+  "openai-compatible",
+  "local-llm",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Arbiter + OVMS shim + dashboard are stdlib-only. STT is optional.
+dependencies = []
+
+[project.optional-dependencies]
+stt = [
+  "torch",
+  "torchaudio",
+  "transformers>=5.16.0",
+  "numpy",
+]
+dev = []
+
+[project.urls]
+Homepage = "https://github.com/dxbh0517/switchyard"
+Repository = "https://github.com/dxbh0517/switchyard"
+Issues = "https://github.com/dxbh0517/switchyard/issues"
+Changelog = "https://github.com/dxbh0517/switchyard/releases"
+
+[project.scripts]
+switchyard = "switchyard.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["switchyard*"]
+
+[tool.setuptools.package-data]
+switchyard = ["static/**/*"]

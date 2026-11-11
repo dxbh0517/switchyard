@@ -1,6 +1,10 @@
 # Switchyard
 
-Switchyard lets several local AI models share one machine without fighting over it. It is one small Python process with four parts:
+[![CI](https://github.com/dxbh0517/switchyard/actions/workflows/ci.yml/badge.svg)](https://github.com/dxbh0517/switchyard/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
+Share one NVIDIA GPU between several local AI services without them fighting over VRAM. Built for single-card stacks that are tired of juggling separate proxies. One small Python process with four optional parts:
 
 - **GPU arbiter.** Several [vLLM](https://github.com/vllm-project/vllm) engines and [ComfyUI](https://github.com/Comfy-Org/ComfyUI) take turns on a single NVIDIA GPU. Only one of them holds the VRAM at a time. The others are kept in vLLM's sleep mode or unloaded, and are woken up when a request for them arrives.
 - **OVMS shim.** It makes [OpenVINO Model Server](https://github.com/openvinotoolkit/model_server) behave like a standard OpenAI-compatible server:
@@ -34,11 +38,16 @@ ComfyUI ──► POST /gpu/acquire ──────┘                   put 
 
 ## Quick start
 
+### Docker
+
+Copy [`docker-compose.example.yml`](docker-compose.example.yml) and adjust ports/models, or start from:
+
 ```yaml
 # docker-compose.yml
 services:
   switchyard:
-    build: ./switchyard            # or: --build-arg WITH_STT=0 for the stdlib-only image
+    build: .                       # Dockerfile is at the repo root
+    # build: { context: ., args: { WITH_STT: "0" } }  # stdlib-only image
     container_name: switchyard
     restart: unless-stopped        # the dashboard's "Restart" button relies on this
     network_mode: host             # reaches engines, ComfyUI and OVMS on localhost
@@ -52,6 +61,14 @@ services:
       - OVMS_UPSTREAM=http://127.0.0.1:8010
 volumes:
   switchyard-data:
+```
+
+### From source
+
+```sh
+python3 -m pip install -e .
+python3 -m switchyard
+# Optional STT: python3 -m pip install -e ".[stt]"  (also needs ffmpeg)
 ```
 
 `ENGINES` is a comma-separated list of `name=backend_host:port@listen_port:free_MiB_needed_to_wake`. Clients send their requests to the listen port.
@@ -138,9 +155,12 @@ The dashboard API only accepts `POST` requests from its own origin.
 ## Development
 
 ```sh
+python3 -m pip install -e .
 python3 -m unittest discover -s tests     # stdlib only; uses fake vLLM/ComfyUI/OVMS servers
 ```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, PR expectations, and [good first issues](https://github.com/dxbh0517/switchyard/labels/good%20first%20issue).
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
