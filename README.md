@@ -67,7 +67,8 @@ volumes:
 
 ```sh
 python3 -m pip install -e .
-python3 -m switchyard
+python3 -m switchyard --help     # env vars and dashboard bind warning
+python3 -m switchyard            # start; same as the `switchyard` console script
 # Optional STT: python3 -m pip install -e ".[stt]"  (also needs ffmpeg)
 ```
 
@@ -89,7 +90,7 @@ The vLLM engines must run with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1
 
 To install the ComfyUI hook, copy `comfyui_node/gpu_arbiter` into `ComfyUI/custom_nodes/`. If Switchyard isn't reachable at `http://host.docker.internal:8000`, set `GPU_ARBITER_URL`.
 
-Without Docker, run `python3 -m switchyard`. Set `SWITCHYARD_SETTINGS` to say where the settings file goes.
+Without Docker, run `python3 -m switchyard`. Set `SWITCHYARD_SETTINGS` to say where the settings file goes. `python3 -m switchyard --help` (or `switchyard --help`) prints the version, key environment variables, and a reminder that the dashboard has no auth and should stay on localhost. `--version` prints the version and exits.
 
 ## Settings
 
@@ -103,7 +104,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | `ENGINES` | `qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500` | restart | The vLLM engines sharing the GPU. The free-VRAM target applies live. |
 | `TEXT_ONLY_ENGINES` | `qwen` | live | Comma-separated. Image parts sent to these engines are replaced with a note. |
 | `COMFY_URL` | `http://127.0.0.1:8188` | live | ComfyUI address. Used to read VRAM, check the queue and unload models. |
-| `LISTEN_HOST` | `0.0.0.0` | restart | Address the engine ports bind to. |
+| `LISTEN_HOST` | `0.0.0.0` | restart | Address the arbiter, OVMS shim, and STT servers bind to. |
 | `IDLE_SLEEP_SEC` | `120` | live | An awake engine with no traffic for this long goes back to sleep. |
 | `SLEEP_LEVEL` | `2` | live | `1` keeps weights in CPU RAM (fast wake). `2` drops them (reload from disk). |
 | `WAKE_ATTEMPTS` | `3` | live | How many times to try waking an engine before returning HTTP 503. |
@@ -115,7 +116,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | Variable | Default | Applies | Description |
 |---|---|---|---|
 | `OVMS_SHIM_ENABLED` | `true` | restart | Turns the shim on or off. |
-| `OVMS_SHIM_PORT` | `8012` | restart | Port the shim listens on. |
+| `OVMS_SHIM_PORT` | `8012` | restart | Port the shim listens on (`LISTEN_HOST`). |
 | `OVMS_UPSTREAM` | `http://127.0.0.1:8010` | live | OVMS REST address. |
 | `RERANK_MODEL` | `qwen3-reranker-0.6b` | live | OVMS model name used for `/v1/rerank`. |
 | `RERANK_INSTRUCTION` | `Given a web search query, …` | live | Default instruction in the Qwen3-Reranker prompt. |
@@ -125,7 +126,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | Variable | Default | Applies | Description |
 |---|---|---|---|
 | `STT_ENABLED` | `true` | restart | Turns speech to text on or off. |
-| `STT_PORT` | `8091` | restart | Port the speech-to-text server listens on. |
+| `STT_PORT` | `8091` | restart | Port the speech-to-text server listens on (`LISTEN_HOST`). |
 | `STT_MODEL_PATH` | `/models/granite-speech-5.0-470m-turboctc` | live | Path to the model. Changing it reloads the model. |
 | `STT_MODEL_ID` | `granite-speech-5.0-470m-turboctc` | live | Name reported by `/v1/models`. |
 | `STT_THREADS` | `8` | live | CPU threads per transcription. |
