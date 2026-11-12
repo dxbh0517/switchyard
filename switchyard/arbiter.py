@@ -11,6 +11,10 @@ it sleep (vLLM sleep mode; level 2 drops the weights and leaves under 1 GiB each
             prompt and POST /gpu/release after it.
   Startup : an engine container calls POST /gpu/loading?engine=NAME before `vllm serve`.
             Engine loads are serialized; once an engine is up it is put to sleep.
+  Health  : a background thread probes vLLM /health and ComfyUI /system_stats without
+            holding the arbiter lock. Failed wakes retry with exponential backoff; an
+            engine that stays down is marked unhealthy, ownership is released, and
+            requests fail fast with HTTP 503 until a later probe recovers it.
 
 GET /gpu/status on any engine port returns the state as JSON. Responses are streamed.
 """
@@ -21,6 +25,7 @@ import json
 import re
 import threading
 import time
+import urllib.error
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
@@ -32,6 +37,31 @@ INFER_PREFIXES = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "
                   "/v1/audio", "/v1/messages", "/tokenize", "/detokenize")
 IMAGE_PART_TYPES = {"image_url", "input_image", "image", "video_url", "input_video"}
 C = "arbiter"
+
+
+class EngineUnavailable(RuntimeError):
+    """Engine is marked down; fail the request without waiting for the GPU."""
+
+    def __init__(self, engine: str, health: dict, retry_after: int):
+        self.engine = engine
+        self.health = health["status"]
+        self.retry_after = retry_after
+        err = health.get("last_error")
+        msg = f"{engine} is {health['status']}"
+        if err:
+            msg += f": {err}"
+        super().__init__(msg)
+
+
+def _blank_health() -> dict:
+    return {"status": "unknown", "last_error": None, "consecutive_failures": 0,
+            "checked_at": None, "seen_up": False}
+
+
+def _health_view(h: dict) -> dict:
+    return {"status": h["status"], "last_error": h["last_error"],
+            "consecutive_failures": h["consecutive_failures"],
+            "checked_at": None if not h["checked_at"] else round(h["checked_at"], 3)}
 
 
 def strip_images(body: bytes | None) -> tuple[bytes | None, int]:
@@ -77,6 +107,9 @@ class Arbiter:
             "loading_until": {e: 0.0 for e in names},
         }
         self.sleeping: dict = {e: None for e in names}      # polled, for the dashboard
+        self.health = {e: _blank_health() for e in names}
+        self.comfy_health = _blank_health()
+        self.waking: set[str] = set()                       # skip failed probes during a wake
         self.gpu: dict = {"free_mb": None, "total_mb": None, "name": None}
         self.comfy_queue: dict = {"running": None, "pending": None}
         self.stats = {e: Counters() for e in names}
@@ -104,8 +137,12 @@ class Arbiter:
     def backend(self, engine, method, path, body=None, headers=None, timeout=600.0):
         cfg = self.engines[engine]
         conn = http.client.HTTPConnection(cfg["host"], cfg["port"], timeout=timeout)
-        conn.request(method, path, body=body, headers=headers or {})
-        return conn, conn.getresponse()
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            return conn, conn.getresponse()
+        except Exception:
+            conn.close()
+            raise
 
     def backend_simple(self, engine, method, path, body=None, timeout=600.0) -> tuple[int, bytes]:
         headers = {"Content-Type": "application/json"} if body is not None else None
@@ -133,6 +170,70 @@ class Arbiter:
         if status != 200:
             raise RuntimeError(f"{what} -> HTTP {status}: {raw[:300]!r}")
 
+    def retry_after(self) -> int:
+        return max(1, int(self.s.get("health_interval_sec")))
+
+    def unavailable(self, engine: str) -> dict | None:
+        """Health snapshot if this engine must not receive traffic, else None."""
+        h = self.health[engine]
+        if h["status"] == "unhealthy":
+            return h
+        if (h["status"] == "unreachable" and h.get("seen_up")
+                and time.time() >= self.state["loading_until"][engine]):
+            return h
+        return None
+
+    def _raise_if_unavailable(self, engine: str) -> None:
+        h = self.unavailable(engine)
+        if h:
+            raise EngineUnavailable(engine, h, self.retry_after())
+
+    def _record_health(self, slot: dict, name: str, status: str, error: str | None) -> None:
+        prev = slot["status"]
+        slot["checked_at"] = time.time()
+        if status == "healthy":
+            slot["consecutive_failures"] = 0
+            slot["last_error"] = None
+            slot["seen_up"] = True
+            slot["status"] = "healthy"
+        else:
+            slot["consecutive_failures"] += 1
+            slot["last_error"] = (error or status)[:300]
+            slot["status"] = status
+        if prev != slot["status"]:
+            extra = f": {slot['last_error']}" if slot["last_error"] else ""
+            log(C, f"{name} health {prev} → {slot['status']}{extra}",
+                "info" if status == "healthy" else "error")
+
+    def _mark_unhealthy(self, engine: str, error: str) -> None:
+        self._record_health(self.health[engine], engine, "unhealthy", error)
+
+    def probe_engine_health(self, engine: str) -> tuple[str, str | None]:
+        """GET /health. Callers must not hold `self.cond` (except a wake already under the lock)."""
+        timeout = self.s.get("health_timeout_sec")
+        try:
+            code, raw = self.backend_simple(engine, "GET", "/health", timeout=timeout)
+            if code == 200:
+                return "healthy", None
+            return "unhealthy", f"HTTP {code}: {raw[:200]!r}"
+        except Exception as e:
+            return "unreachable", str(e)
+
+    def probe_comfy_health(self) -> tuple[str, str | None]:
+        """GET ComfyUI /system_stats. Must not hold `self.cond`."""
+        timeout = self.s.get("health_timeout_sec")
+        try:
+            req = urllib.request.Request(f"{self.comfy_url()}/system_stats")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if getattr(r, "status", 200) != 200:
+                    return "unhealthy", f"HTTP {r.status}"
+                json.load(r)
+                return "healthy", None
+        except urllib.error.HTTPError as e:
+            return "unhealthy", f"HTTP {e.code}"
+        except Exception as e:
+            return "unreachable", str(e)
+
     # ------------------------------------------------------------ engine power
     def wake(self, engine: str) -> None:
         if self.is_sleeping(engine):
@@ -155,6 +256,10 @@ class Arbiter:
             self.stats[engine].set("last_wake_sec", round(took, 1))
             log(C, f"{engine} awake in {took:.1f}s")
         self.sleeping[engine] = False
+        status, err = self.probe_engine_health(engine)
+        if status != "healthy":
+            raise RuntimeError(f"{engine} not healthy after wake: {err or status}")
+        self._record_health(self.health[engine], engine, "healthy", None)
 
     def sleep(self, engine: str, reason: str) -> None:
         if self.is_sleeping(engine) is False:
@@ -227,13 +332,17 @@ class Arbiter:
     # ------------------------------------------------------------ ownership
     def engine_enter(self, engine: str) -> None:
         st = self.state
+        self._raise_if_unavailable(engine)
         with self.cond:
+            self._raise_if_unavailable(engine)
             # ComfyUI has priority while running or waiting; other engines finish their
             # in-flight requests first; nothing wakes while an engine is loading.
             while not (st["comfy_active"] == 0 and not self.any_inflight(engine) and not self.loading_engines()):
+                self._raise_if_unavailable(engine)
                 self.cond.wait(timeout=5)
             if st["owner"] != engine:
                 while st["comfy_active"] or self.any_inflight(engine) or self.comfy_running():
+                    self._raise_if_unavailable(engine)
                     self.cond.wait(timeout=2)
                 prev = st["owner"]
                 self.sleep_others(engine, f"switching to {engine}")
@@ -241,18 +350,27 @@ class Arbiter:
                 if prev not in self.engines:  # ComfyUI or nobody held the GPU
                     self.comfy_unload(target)
                 attempts = self.s.get("wake_attempts")
-                for attempt in range(1, attempts + 1):
-                    try:
-                        self.wake(engine)
-                        break
-                    except Exception as e:
-                        log(C, f"wake {engine} failed (attempt {attempt}/{attempts}): {e}", "error")
-                        if attempt == attempts:
-                            st["owner"] = None
-                            raise RuntimeError(f"{engine} could not wake: {e}") from e
-                        self.comfy_unload(target)
-                        time.sleep(2)
+                delay = self.s.get("wake_backoff_sec")
+                self.waking.add(engine)
+                try:
+                    for attempt in range(1, attempts + 1):
+                        try:
+                            self.wake(engine)
+                            break
+                        except Exception as e:
+                            log(C, f"wake {engine} failed (attempt {attempt}/{attempts}): {e}", "error")
+                            if attempt == attempts:
+                                self._mark_unhealthy(engine, str(e))
+                                st["owner"] = None
+                                self.cond.notify_all()
+                                raise RuntimeError(f"{engine} could not wake: {e}") from e
+                            self.comfy_unload(target)
+                            time.sleep(delay)
+                            delay *= 2
+                finally:
+                    self.waking.discard(engine)
                 st["owner"] = engine
+            self._raise_if_unavailable(engine)
             st["inflight"][engine] += 1
             st["last_infer"][engine] = time.time()
 
@@ -349,9 +467,11 @@ class Arbiter:
                 "state": "loading" if loading else {True: "asleep", False: "awake", None: "down"}[s],
                 "inflight": st["inflight"][e],
                 "idle_sec": round(now - st["last_infer"][e]),
+                "health": _health_view(self.health[e]),
                 **self.stats[e].snapshot(),
             }
         return {"owner": st["owner"], "comfy_active": st["comfy_active"], "comfy_queue": self.comfy_queue,
+                "comfy_health": _health_view(self.comfy_health),
                 "gpu": self.gpu, "engines": engines, "idle_sleep_sec": self.s.get("idle_sleep_sec")}
 
     # ------------------------------------------------------------ background threads
@@ -413,6 +533,23 @@ class Arbiter:
             self.comfy_running()
             time.sleep(3)
 
+    def health_monitor(self) -> None:
+        """Probe engines and ComfyUI. HTTP runs outside `self.cond`."""
+        while True:
+            results = {e: self.probe_engine_health(e) for e in self.engines}
+            comfy = self.probe_comfy_health()
+            with self.cond:
+                for e, (status, err) in results.items():
+                    if status != "healthy" and e in self.waking:
+                        continue
+                    self._record_health(self.health[e], e, status, err)
+                    if (self.unavailable(e) and self.state["owner"] == e
+                            and self.state["inflight"][e] == 0):
+                        self.state["owner"] = None
+                self._record_health(self.comfy_health, "ComfyUI", *comfy)
+                self.cond.notify_all()
+            time.sleep(self.s.get("health_interval_sec"))
+
     # ------------------------------------------------------------ HTTP
     def make_handler(self, engine: str):
         arb = self
@@ -451,11 +588,25 @@ class Arbiter:
                     body, n = strip_images(body)
                     if n:
                         log(C, f"stripped {n} image part(s) from a request to text-only {engine}")
+                down = arb.unavailable(engine)
+                if down and not infer:
+                    err = EngineUnavailable(engine, down, arb.retry_after())
+                    arb.stats[engine].inc("errors")
+                    self.send_json(503, {"error": str(err), "engine": engine, "health": err.health},
+                                   extra={"Retry-After": str(err.retry_after)})
+                    return
                 if infer:
                     try:
                         arb.engine_enter(engine)
+                    except EngineUnavailable as e:
+                        arb.stats[engine].inc("errors")
+                        self.send_json(503, {"error": str(e), "engine": e.engine, "health": e.health},
+                                       extra={"Retry-After": str(e.retry_after)})
+                        return
                     except Exception as e:
-                        self.send_json(503, {"error": str(e)})
+                        arb.stats[engine].inc("errors")
+                        self.send_json(503, {"error": str(e)},
+                                       extra={"Retry-After": str(arb.retry_after())})
                         return
                     arb.stats[engine].inc("requests")
                 try:
@@ -485,7 +636,7 @@ class Arbiter:
         host = self.s.get("listen_host")
         for e, cfg in self.engines.items():
             log(C, f"{e}: {host}:{cfg['listen']} -> {cfg['backend']} (wake needs {cfg['free_mb']} MiB free)")
-        for target in (self.idle_watcher, self.poller):
+        for target in (self.idle_watcher, self.poller, self.health_monitor):
             threading.Thread(target=target, daemon=True).start()
         for e, cfg in self.engines.items():
             threading.Thread(target=self.startup_watcher, args=(e,), daemon=True).start()

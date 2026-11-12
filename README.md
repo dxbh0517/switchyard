@@ -35,6 +35,7 @@ ComfyUI ──► POST /gpu/acquire ──────┘                   put 
 - **ComfyUI jobs:** the hook in [`comfyui_node/`](comfyui_node/gpu_arbiter) calls `/gpu/acquire` before each prompt and `/gpu/release` after it. If Switchyard can't be reached, ComfyUI runs normally.
 - **Engine startup:** an engine container calls `POST /gpu/loading?engine=NAME` before it starts `vllm serve`. Loads are serialized, and each engine is put to sleep as soon as it is up.
 - **Text-only engines:** image parts in requests to a text-only engine are replaced with a short note, so the request doesn't fail with HTTP 400.
+- **Health:** a background thread probes each engine's `/health` and ComfyUI `/system_stats` every `HEALTH_INTERVAL_SEC` (HTTP calls do not hold the arbiter lock). State is `healthy`, `unhealthy`, or `unreachable`. An engine that is unhealthy, or unreachable after it has been up, is not sent traffic: clients get HTTP 503 with a `Retry-After` header. A failed wake (HTTP error, timeout, or still unhealthy after wake) is retried with exponential backoff (`WAKE_ATTEMPTS`, `WAKE_BACKOFF_SEC`). If every attempt fails, the engine is marked unhealthy, GPU ownership is released, and waiting requests fail fast instead of hanging. Traffic resumes automatically once a later health check succeeds.
 
 ## Quick start
 
@@ -106,7 +107,10 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | `LISTEN_HOST` | `0.0.0.0` | restart | Address the engine ports bind to. |
 | `IDLE_SLEEP_SEC` | `120` | live | An awake engine with no traffic for this long goes back to sleep. |
 | `SLEEP_LEVEL` | `2` | live | `1` keeps weights in CPU RAM (fast wake). `2` drops them (reload from disk). |
-| `WAKE_ATTEMPTS` | `3` | live | How many times to try waking an engine before returning HTTP 503. |
+| `WAKE_ATTEMPTS` | `3` | live | How many times to try waking an engine before marking it unhealthy and returning HTTP 503. |
+| `WAKE_BACKOFF_SEC` | `1` | live | Initial delay between wake attempts; doubles after each failure (1s, 2s, 4s, …). |
+| `HEALTH_INTERVAL_SEC` | `15` | live | How often to probe vLLM `/health` and ComfyUI `/system_stats`. |
+| `HEALTH_TIMEOUT_SEC` | `5` | live | HTTP timeout for each health probe, and for the post-wake health check. |
 | `COMFY_FREE_WAIT_SEC` | `30` | live | How long to wait for ComfyUI's unload to free the target VRAM. |
 | `LOADING_MAX_SEC` | `900` | live | How long a starting engine may hold the GPU before its claim expires. |
 
