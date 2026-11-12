@@ -52,9 +52,36 @@ def get(url):
         return json.loads(r.read())
 
 
+def wait_until(pred, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return bool(pred())
+
+
+def this_thread_holds(cond) -> bool:
+    """True if the calling thread owns the arbiter condition (RLock has no public locked())."""
+    return cond._lock._is_owned()
+
+
+def wrap_occupancy_http(arb, held: list):
+    """Record whether the caller still holds the arbiter lock when wake/sleep/is_sleeping run."""
+    def wrap(fn):
+        def inner(*a, **k):
+            held.append(this_thread_holds(arb.cond))
+            return fn(*a, **k)
+        return inner
+    for b in arb.ctl.values():
+        b.wake = wrap(b.wake)
+        b.sleep = wrap(b.sleep)
+        b.is_sleeping = wrap(b.is_sleeping)
+
+
 def fake_engine():
     """A vLLM-like backend with sleep mode."""
-    st = {"sleeping": True, "calls": []}
+    st = {"sleeping": True, "calls": [], "serving": 0, "hold": None, "is_sleeping_gets": 0}
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -72,6 +99,7 @@ def fake_engine():
 
         def do_GET(self):
             if self.path == "/is_sleeping":
+                st["is_sleeping_gets"] += 1
                 self._send({"is_sleeping": st["sleeping"]})
             else:
                 self._send({"data": []})
@@ -85,7 +113,14 @@ def fake_engine():
                 st["sleeping"] = False
             if self.path.startswith("/v1/chat/completions"):
                 st["last_body"] = json.loads(body)
-                self._send({"id": "x", "awake_when_served": not st["sleeping"]})
+                st["serving"] += 1
+                try:
+                    hold = st["hold"]
+                    if hold is not None:
+                        hold.wait(timeout=10)
+                    self._send({"id": "x", "awake_when_served": not st["sleeping"]})
+                finally:
+                    st["serving"] -= 1
             else:
                 self._send({})
 
@@ -277,6 +312,33 @@ class ArbiterTests(unittest.TestCase):
         self.assertIn("budget", st)
         self.assertIn("vram_source", st["engines"]["a"])
 
+    def test_exclusive_serializes_other_engine(self):
+        gate = threading.Event()
+        self.a_state["hold"] = gate
+        ta = threading.Thread(target=lambda: self.chat(self.la))
+        ta.start()
+        self.assertTrue(wait_until(lambda: self.a_state["serving"]))
+        tb_done = []
+        tb = threading.Thread(target=lambda: tb_done.append(self.chat(self.lb)))
+        tb.start()
+        time.sleep(0.3)
+        self.assertFalse(self.b_state["serving"], "b must wait while a is in flight")
+        self.assertFalse(tb_done)
+        gate.set()
+        ta.join(5)
+        tb.join(5)
+        self.assertTrue(tb_done)
+        self.assertTrue(self.a_state["sleeping"])
+        self.assertFalse(self.b_state["sleeping"])
+
+    def test_occupancy_http_drops_the_lock(self):
+        held = []
+        wrap_occupancy_http(self.arb, held)
+        self.chat(self.la)
+        self.chat(self.lb)
+        self.assertTrue(held, "wake/sleep should have run")
+        self.assertFalse(any(held), "occupancy HTTP must not run under the arbiter lock")
+
 
 class BackendTests(unittest.TestCase):
     def test_vllm_health_wake_sleep(self):
@@ -456,6 +518,65 @@ class ArbiterSharedTests(unittest.TestCase):
         cost, src = self.arb.cost_of("a")
         self.assertEqual(src, "estimate")
         self.assertEqual(cost, estimate_vram_mb(7_000_000_000, quant="q4_k", context_length=4096))
+
+    def test_resident_engines_serve_in_parallel(self):
+        self.chat(self.la)
+        self.chat(self.lb)
+        gate = threading.Event()
+        self.a_state["hold"] = self.b_state["hold"] = gate
+        ra, rb = {}, {}
+        ta = threading.Thread(target=lambda: ra.update(self.chat(self.la)))
+        tb = threading.Thread(target=lambda: rb.update(self.chat(self.lb)))
+        ta.start()
+        tb.start()
+        self.assertTrue(wait_until(lambda: self.a_state["serving"] and self.b_state["serving"]),
+                        "both resident engines should be serving at once")
+        gate.set()
+        ta.join(5)
+        tb.join(5)
+        self.assertTrue(ra.get("awake_when_served"))
+        self.assertTrue(rb.get("awake_when_served"))
+
+    def test_eviction_waits_for_victim_inflight(self):
+        self.arb.s.update({"engines": [
+            {**self.arb.s.engine("a"), "vram_mb": 4000},
+            {**self.arb.s.engine("b"), "vram_mb": 4000},
+        ]})
+        self.chat(self.la)
+        gate = threading.Event()
+        self.a_state["hold"] = gate
+        ta = threading.Thread(target=lambda: self.chat(self.la))
+        ta.start()
+        self.assertTrue(wait_until(lambda: self.a_state["serving"]))
+        tb_done = []
+        tb = threading.Thread(target=lambda: tb_done.append(self.chat(self.lb)))
+        tb.start()
+        time.sleep(0.3)
+        self.assertTrue(self.a_state["serving"])
+        self.assertFalse(self.a_state["sleeping"], "cannot evict a while it still has a request")
+        self.assertFalse(tb_done)
+        self.assertFalse(self.b_state["serving"])
+        gate.set()
+        ta.join(5)
+        tb.join(5)
+        self.assertTrue(tb_done)
+        self.assertTrue(self.a_state["sleeping"])
+        self.assertFalse(self.b_state["sleeping"])
+
+    def test_fast_path_does_not_probe_is_sleeping(self):
+        self.chat(self.la)
+        n = self.a_state["is_sleeping_gets"]
+        self.chat(self.la)
+        self.assertEqual(self.a_state["is_sleeping_gets"], n,
+                         "already-resident enter must use cached sleep state, not HTTP")
+
+    def test_occupancy_http_drops_the_lock(self):
+        held = []
+        wrap_occupancy_http(self.arb, held)
+        self.chat(self.la)
+        self.chat(self.lb)
+        self.assertTrue(held, "wake/sleep should have run")
+        self.assertFalse(any(held), "occupancy HTTP must not run under the arbiter lock")
 
 
 class OvmsShimTests(unittest.TestCase):

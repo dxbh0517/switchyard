@@ -2,18 +2,19 @@
 
 Default (`shared_vram=false`): exactly one of {each vLLM engine, ComfyUI} owns the
 VRAM at a time. Engines that don't own it sleep (vLLM sleep mode; level 2 drops the
-weights and leaves under 1 GiB each).
+weights and leaves under 1 GiB each). Inference is serialized.
 
 With `shared_vram=true`, several engines may stay awake while their VRAM costs fit
-in the card budget minus a safety margin. A new wake evicts least-recently-used
-residents until it fits. Inference is still serialized (one request owner at a
-time). ComfyUI still takes the whole GPU for a prompt.
+in the card budget minus a safety margin. Resident engines serve in parallel. A wake
+that does not fit evicts least-recently-used residents, waiting only for those
+victims' in-flight requests. ComfyUI still takes the whole GPU for a prompt.
 
-  Engines : each engine gets an OpenAI-compatible listen port. Before an inference
-            request is forwarded, the arbiter waits for ComfyUI and the other engines
-            to finish, then wakes this engine (sleeping others only when exclusive,
-            or when the budget requires it). After `idle_sleep_sec` without traffic
-            an idle resident goes back to sleep.
+Occupancy HTTP (sleep/wake/ComfyUI) runs outside the condition lock. `switching`
+and `evicting` mark a transition so new requests wait without holding the lock
+across the network.
+
+  Engines : each engine gets an OpenAI-compatible listen port. After `idle_sleep_sec`
+            without traffic an idle resident goes back to sleep.
   ComfyUI : the gpu_arbiter custom node (comfyui_node/) calls POST /gpu/acquire
             before each prompt and POST /gpu/release after it.
   Startup : an engine container calls POST /gpu/loading?engine=NAME before `vllm serve`.
@@ -85,8 +86,10 @@ class Arbiter:
             "last_infer": {e: now for e in names},
             "sleep_level": {e: settings.get("sleep_level") for e in names},
             "loading_until": {e: 0.0 for e in names},
+            "switching": None,                              # engine name | "comfy" | None
+            "evicting": set(),                              # engines being slept
         }
-        self.sleeping: dict = {e: None for e in names}      # polled, for the dashboard
+        self.sleeping: dict = {e: None for e in names}      # cached; occupancy HTTP updates it
         self.measured_mb: dict = {}                         # engine -> MiB observed after a wake
         self.gpu: dict = {"free_mb": None, "total_mb": None, "name": None}
         self.comfy_queue: dict = {"running": None, "pending": None}
@@ -141,6 +144,7 @@ class Arbiter:
         return conn, conn.getresponse()
 
     def is_sleeping(self, engine: str) -> bool | None:
+        """Probe the backend (HTTP). Callers must not hold `self.cond`."""
         val = self.ctl[engine].is_sleeping()
         self.sleeping[engine] = val
         return val
@@ -150,9 +154,37 @@ class Arbiter:
             self.state["owner"] = next(
                 (e for e in self.engines if e != engine and self.sleeping[e] is False), None)
 
-    # ------------------------------------------------------------ engine power
+    def _admit(self, engine: str) -> None:
+        self.state["owner"] = engine
+        self.state["inflight"][engine] += 1
+        self.state["last_infer"][engine] = time.time()
+
+    def _begin_switch(self, who, victims) -> None:
+        self.state["switching"] = who
+        self.state["evicting"] = set(victims)
+        self.cond.notify_all()
+
+    def _end_switch(self, who) -> None:
+        if self.state["switching"] == who:
+            self.state["switching"] = None
+        self.state["evicting"] = set()
+        self.cond.notify_all()
+
+    def _victims_locked(self, engine: str) -> list[str]:
+        """Who must sleep so `engine` can wake. Uses cached `sleeping`, no HTTP."""
+        awake = [e for e in self.engines if e != engine and self.sleeping[e] is False]
+        if not self.shared():
+            return awake
+        room = self.usable()
+        if room is None:
+            return awake
+        resident = {e: self.state["last_infer"][e] for e in awake}
+        costs = {e: self.cost_mb(e) for e in awake}
+        return lru_victims(resident, costs, engine, self.cost_mb(engine), room)
+
+    # ------------------------------------------------------------ engine power (no cond held)
     def wake(self, engine: str) -> None:
-        if self.ctl[engine].is_sleeping():
+        if self.sleeping[engine]:
             level = self.state["sleep_level"][engine]
             log(C, f"waking {engine} (from level {level})")
             t = time.time()
@@ -164,7 +196,7 @@ class Arbiter:
         self.sleeping[engine] = False
 
     def sleep(self, engine: str, reason: str) -> None:
-        if self.ctl[engine].is_sleeping() is False:
+        if self.sleeping[engine] is False:
             level = self.s.get("sleep_level")
             log(C, f"sleeping {engine} level={level} ({reason})")
             t = time.time()
@@ -174,33 +206,33 @@ class Arbiter:
             log(C, f"{engine} asleep in {time.time() - t:.1f}s")
         self.sleeping[engine] = True
 
-    def sleep_others(self, keep: str | None, reason: str) -> None:
-        for e in self.engines:
-            if e != keep and self.is_sleeping(e) is False:
-                try:
-                    self.sleep(e, reason)
-                except Exception as ex:
-                    log(C, f"sleep {e} failed: {ex}", "error")
-
-    def _evict_for(self, engine: str) -> None:
-        """Sleep whoever must move so `engine` can wake. Exclusive: everyone else."""
-        if not self.shared():
-            self.sleep_others(engine, f"switching to {engine}")
-            return
-        if self.gpu.get("total_mb") is None:
-            self.gpu_free_mb()
-        room = self.usable()
-        if room is None:
-            self.sleep_others(engine, f"switching to {engine} (budget unknown)")
-            return
-        resident = {e: self.state["last_infer"][e]
-                    for e in self.engines if e != engine and self.is_sleeping(e) is False}
-        costs = {e: self.cost_mb(e) for e in resident}
-        for name in lru_victims(resident, costs, engine, self.cost_mb(engine), room):
+    def _sleep_list(self, engines: list[str], reason: str) -> None:
+        for e in engines:
             try:
-                self.sleep(name, f"LRU for {engine}")
+                self.sleep(e, reason)
             except Exception as ex:
-                log(C, f"sleep {name} failed: {ex}", "error")
+                log(C, f"sleep {e} failed: {ex}", "error")
+
+    def _apply_wake(self, engine: str, victims: list[str], reason: str, unload_comfy: bool) -> None:
+        while self.comfy_running():
+            time.sleep(0.5)
+        self._sleep_list(victims, reason)
+        target = self.free_mb(engine)
+        if unload_comfy:
+            self.comfy_unload(target)
+        attempts = self.s.get("wake_attempts")
+        for attempt in range(1, attempts + 1):
+            try:
+                before = self.gpu_free_mb()
+                self.wake(engine)
+                self._note_measured(engine, before)
+                return
+            except Exception as e:
+                log(C, f"wake {engine} failed (attempt {attempt}/{attempts}): {e}", "error")
+                if attempt == attempts:
+                    raise RuntimeError(f"{engine} could not wake: {e}") from e
+                self.comfy_unload(target)
+                time.sleep(2)
 
     def _note_measured(self, engine: str, before: float | None) -> None:
         after = self.gpu_free_mb()
@@ -231,38 +263,48 @@ class Arbiter:
     def engine_enter(self, engine: str) -> None:
         st = self.state
         with self.cond:
-            # ComfyUI has priority while running or waiting; other engines finish their
-            # in-flight requests first; nothing wakes while an engine is loading.
-            while not (st["comfy_active"] == 0 and not self.any_inflight(engine) and not self.loading_engines()):
-                self.cond.wait(timeout=5)
-            needs_wake = (self.is_sleeping(engine) is not False) if self.shared() else st["owner"] != engine
-            if needs_wake:
-                while st["comfy_active"] or self.any_inflight(engine) or self.comfy_running():
-                    self.cond.wait(timeout=2)
-                prev = st["owner"]
-                self._evict_for(engine)
-                target = self.free_mb(engine)
-                if prev not in self.engines:  # ComfyUI or nobody held the GPU
-                    self.comfy_unload(target)
-                attempts = self.s.get("wake_attempts")
-                for attempt in range(1, attempts + 1):
-                    try:
-                        before = self.gpu_free_mb()
-                        self.wake(engine)
-                        self._note_measured(engine, before)
-                        break
-                    except Exception as e:
-                        log(C, f"wake {engine} failed (attempt {attempt}/{attempts}): {e}", "error")
-                        if attempt == attempts:
-                            st["owner"] = None
-                            raise RuntimeError(f"{engine} could not wake: {e}") from e
-                        self.comfy_unload(target)
-                        time.sleep(2)
-                st["owner"] = engine
-            elif self.shared():
-                st["owner"] = engine
-            st["inflight"][engine] += 1
-            st["last_infer"][engine] = time.time()
+            while True:
+                if st["comfy_active"] or self.loading_engines() or engine in st["evicting"]:
+                    self.cond.wait(timeout=5)
+                    continue
+                resident = self.sleeping[engine] is False
+                if self.shared():
+                    if resident:
+                        self._admit(engine)
+                        return
+                    if st["switching"]:
+                        self.cond.wait(timeout=5)
+                        continue
+                else:
+                    if self.any_inflight(engine) or st["switching"]:
+                        self.cond.wait(timeout=5)
+                        continue
+                    if st["owner"] == engine:
+                        self._admit(engine)
+                        return
+                break
+
+            while st["comfy_active"] or st["switching"] or self.loading_engines():
+                self.cond.wait(timeout=2)
+            victims = self._victims_locked(engine)
+            while any(st["inflight"][v] for v in victims):
+                self.cond.wait(timeout=2)
+                victims = self._victims_locked(engine)
+            unload_comfy = st["owner"] not in self.engines
+            reason = f"LRU for {engine}" if self.shared() else f"switching to {engine}"
+            self._begin_switch(engine, victims)
+
+        woke = False
+        try:
+            self._apply_wake(engine, victims, reason, unload_comfy)
+            woke = True
+        finally:
+            with self.cond:
+                self._end_switch(engine)
+                if woke:
+                    self._admit(engine)
+                else:
+                    st["owner"] = None
 
     def engine_exit(self, engine: str) -> None:
         with self.cond:
@@ -271,14 +313,23 @@ class Arbiter:
             self.cond.notify_all()
 
     def comfy_acquire(self) -> None:
+        st = self.state
         with self.cond:
-            self.state["comfy_active"] += 1
-            while self.any_inflight() or self.loading_engines():
+            st["comfy_active"] += 1
+            while self.any_inflight() or self.loading_engines() or st["switching"]:
                 self.cond.wait(timeout=5)
-            if self.state["owner"] != "comfy":
-                self.sleep_others(None, "ComfyUI prompt")
-                self.state["owner"] = "comfy"
+            if st["owner"] == "comfy":
+                return
+            victims = [e for e in self.engines if self.sleeping[e] is False]
+            self._begin_switch("comfy", victims)
+        try:
+            self._sleep_list(victims, "ComfyUI prompt")
+            with self.cond:
+                st["owner"] = "comfy"
                 log(C, "ComfyUI owns the GPU")
+        finally:
+            with self.cond:
+                self._end_switch("comfy")
 
     def comfy_release(self) -> None:
         with self.cond:
@@ -294,12 +345,18 @@ class Arbiter:
             renew = time.time() < st["loading_until"][engine]
             if not renew:
                 while not (not self.loading_engines(engine) and st["comfy_active"] == 0
-                           and not self.any_inflight(engine)):
+                           and not self.any_inflight(engine) and not st["switching"]):
                     self.cond.wait(timeout=5)
             st["loading_until"][engine] = time.time() + self.s.get("loading_max_sec")
             st["owner"] = None
             log(C, f"{engine} is loading")
-            self.sleep_others(engine, f"{engine} loading")
+            victims = [e for e in self.engines if e != engine and self.sleeping[e] is False]
+            self._begin_switch(engine, victims)
+        try:
+            self._sleep_list(victims, f"{engine} loading")
+        finally:
+            with self.cond:
+                self._end_switch(engine)
         self.comfy_unload(self.free_mb(engine), require_idle=not renew)
 
     # ------------------------------------------------------------ dashboard actions
@@ -312,20 +369,30 @@ class Arbiter:
                     if self.state["inflight"][target]:
                         log(C, f"not sleeping {target}: requests in flight", "warn")
                         return
+                    if self.sleeping[target] is not False:
+                        return
+                    self._begin_switch(target, [target])
+                try:
                     self.sleep(target, "dashboard")
-                    self._release_owner(target)
+                finally:
+                    with self.cond:
+                        self._release_owner(target)
+                        self._end_switch(target)
         elif name == "warm":
             def run():
                 self.engine_enter(target)
                 self.engine_exit(target)
         elif name == "comfy_unload":
             def run():
-                if self.state["comfy_active"]:
-                    log(C, "not unloading ComfyUI: a prompt is running", "warn")
-                    return
+                with self.cond:
+                    if self.state["comfy_active"]:
+                        log(C, "not unloading ComfyUI: a prompt is running", "warn")
+                        return
                 self.comfy_unload(0)
-                if self.state["owner"] == "comfy":
-                    self.state["owner"] = None
+                with self.cond:
+                    if self.state["owner"] == "comfy":
+                        self.state["owner"] = None
+                    self.cond.notify_all()
         elif name == "comfy_release":
             def run():
                 with self.cond:
@@ -368,6 +435,7 @@ class Arbiter:
                 "gpu": self.gpu, "engines": engines, "idle_sleep_sec": self.s.get("idle_sleep_sec"),
                 "placement": "shared" if self.shared() else "exclusive",
                 "resident": resident,
+                "switching": st["switching"],
                 "budget": {
                     "total_mb": int(self.s.get("vram_budget_mb") or 0) or self.gpu.get("total_mb"),
                     "safety_mb": self.s.get("vram_safety_mb"),
@@ -380,19 +448,27 @@ class Arbiter:
         stale_since = None
         while True:
             time.sleep(10)
-            st = self.state
-            # Safety valve: ComfyUI died mid-prompt and never released.
-            if st["comfy_active"] and not self.any_inflight() and self.comfy_running() is not True:
-                stale_since = stale_since or time.time()
-                if time.time() - stale_since > 60:
-                    with self.cond:
-                        log(C, "ComfyUI claim looks stale; releasing", "warn")
-                        st["comfy_active"] = 0
-                        self.cond.notify_all()
+            with self.cond:
+                comfy_active = self.state["comfy_active"]
+                busy = self.any_inflight()
+            if comfy_active and not busy:
+                if self.comfy_running() is not True:
+                    stale_since = stale_since or time.time()
+                    if time.time() - stale_since > 60:
+                        with self.cond:
+                            log(C, "ComfyUI claim looks stale; releasing", "warn")
+                            self.state["comfy_active"] = 0
+                            self.cond.notify_all()
+                        stale_since = None
+                else:
                     stale_since = None
             else:
                 stale_since = None
+            to_sleep = []
             with self.cond:
+                st = self.state
+                if st["switching"]:
+                    continue
                 idle_limit = self.s.get("idle_sleep_sec")
                 now = time.time()
                 if self.shared():
@@ -401,13 +477,20 @@ class Arbiter:
                     owner = st["owner"]
                     candidates = [owner] if owner in self.engines else []
                 for e in candidates:
-                    if (self.is_sleeping(e) is False and st["inflight"][e] == 0
+                    if (self.sleeping[e] is False and st["inflight"][e] == 0
                             and now - st["last_infer"][e] >= idle_limit):
-                        try:
-                            self.sleep(e, "idle")
-                            self._release_owner(e)
-                        except Exception as ex:
-                            log(C, f"idle sleep {e} failed: {ex}", "error")
+                        to_sleep.append(e)
+                if to_sleep:
+                    self._begin_switch(to_sleep[0], to_sleep)
+            if not to_sleep:
+                continue
+            try:
+                self._sleep_list(to_sleep, "idle")
+            finally:
+                with self.cond:
+                    for e in to_sleep:
+                        self._release_owner(e)
+                    self._end_switch(to_sleep[0])
 
     def startup_watcher(self, engine: str) -> None:
         """Once an engine is up, put it to sleep so the GPU is free; repeat after restarts."""
@@ -415,14 +498,22 @@ class Arbiter:
             while self.is_sleeping(engine) is None:
                 time.sleep(5)
             log(C, f"{engine} backend ready")
+            should_sleep = False
             with self.cond:
                 self.state["loading_until"][engine] = 0.0
-                if self.state["owner"] != engine and self.state["inflight"][engine] == 0:
-                    try:
-                        self.sleep(engine, "startup")
-                    except Exception as e:
-                        log(C, f"startup sleep {engine} failed: {e}", "error")
+                if (self.state["owner"] != engine and self.state["inflight"][engine] == 0
+                        and not self.state["switching"] and self.sleeping[engine] is False):
+                    should_sleep = True
+                    self._begin_switch(engine, [engine])
                 self.cond.notify_all()
+            if should_sleep:
+                try:
+                    self.sleep(engine, "startup")
+                except Exception as e:
+                    log(C, f"startup sleep {engine} failed: {e}", "error")
+                finally:
+                    with self.cond:
+                        self._end_switch(engine)
             # /is_sleeping can time out during a level-2 wake, so require several misses.
             misses = 0
             while misses < 4:

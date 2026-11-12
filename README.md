@@ -27,8 +27,8 @@ client ──► :8005 (engine "vision") ─┼──► Switchyard ──► wa
 ComfyUI ──► POST /gpu/acquire ──────┘                   sleep others only when exclusive, or when the budget requires it
 ```
 
-- **When a request arrives:** Switchyard first waits for any ComfyUI job and for other engines' requests to finish (inference is serialized even in shared mode). Next, in the default exclusive mode, it puts the current owner to sleep or asks ComfyUI to unload. Then it wakes the requested engine and forwards the request. Responses are streamed, so SSE works.
-- **Shared VRAM (`SHARED_VRAM=true`):** engines that already fit stay awake. A wake that would exceed the card budget minus `VRAM_SAFETY_MB` evicts the least-recently used resident first. ComfyUI still takes the whole GPU for a prompt. If the budget is unknown (no `VRAM_BUDGET_MB` and ComfyUI has not reported total VRAM), shared mode falls back to exclusive eviction.
+- **When a request arrives:** In the default exclusive mode, Switchyard waits for any ComfyUI job and for other engines' requests to finish, puts the current owner to sleep or asks ComfyUI to unload, then wakes the requested engine and forwards the request. Responses are streamed, so SSE works.
+- **Shared VRAM (`SHARED_VRAM=true`):** engines that already fit stay awake and serve in parallel. A wake that would exceed the card budget minus `VRAM_SAFETY_MB` waits only for the least-recently used victim's in-flight requests, then evicts it. Occupancy HTTP (sleep/wake/ComfyUI) does not hold the arbiter lock. ComfyUI still takes the whole GPU for a prompt. If the budget is unknown (no `VRAM_BUDGET_MB` and ComfyUI has not reported total VRAM), shared mode falls back to exclusive eviction.
 - **After `IDLE_SLEEP_SEC` without traffic:** that engine goes back to sleep, and the VRAM is free for whatever comes next.
 - **Sleep levels:**
   - Level 2 drops the weights and reloads them from disk (the page cache when warm). Each sleeping engine keeps under 1 GiB of VRAM.
@@ -113,7 +113,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | `WAKE_ATTEMPTS` | `3` | live | How many times to try waking an engine before returning HTTP 503. |
 | `COMFY_FREE_WAIT_SEC` | `30` | live | How long to wait for ComfyUI's unload to free the target VRAM. |
 | `LOADING_MAX_SEC` | `900` | live | How long a starting engine may hold the GPU before its claim expires. |
-| `SHARED_VRAM` | `false` | live | Off: one occupant (today's behavior). On: keep several engines resident while they fit the budget. |
+| `SHARED_VRAM` | `false` | live | Off: one occupant (today's behavior). On: keep several engines resident while they fit the budget; those engines serve in parallel. |
 | `VRAM_BUDGET_MB` | `0` | live | Card size in MiB for shared placement. `0` = use the total VRAM ComfyUI reports. |
 | `VRAM_SAFETY_MB` | `1024` | live | Headroom subtracted from the budget so a wake does not OOM. |
 

@@ -57,8 +57,9 @@ FIELDS: list[Field] = [
           help="How long a starting engine may hold the GPU before its claim expires."),
     Field("shared_vram", "arbiter", "Shared VRAM", "bool", False, "SHARED_VRAM",
           help="Off (default): one occupant at a time. On: keep several engines awake while "
-               "their VRAM costs fit the budget; evict least-recently used when a wake would not fit. "
-               "Inference is still one engine at a time. ComfyUI still takes the whole GPU."),
+               "their VRAM costs fit the budget; they serve in parallel. A wake that would not fit "
+               "evicts least-recently used (after that victim's in-flight requests drain). "
+               "ComfyUI still takes the whole GPU."),
     Field("vram_budget_mb", "arbiter", "VRAM budget (MiB)", "int", 0, "VRAM_BUDGET_MB", min=0,
           help="Card size used for shared placement. 0 = use the total VRAM ComfyUI reports."),
     Field("vram_safety_mb", "arbiter", "VRAM safety margin (MiB)", "int", 1024, "VRAM_SAFETY_MB", min=0,
