@@ -67,8 +67,10 @@ volumes:
 
 ```sh
 python3 -m pip install -e .
-python3 -m switchyard
+python3 -m switchyard --help     # commands and env vars
+python3 -m switchyard            # start; same as the `switchyard` console script
 # Optional STT: python3 -m pip install -e ".[stt]"  (also needs ffmpeg)
+# Optional desktop tray: python3 -m pip install -e ".[tray]"  then `switchyard tray`
 ```
 
 `ENGINES` is a comma-separated list of `name=backend_host:port@listen_port:free_MiB_needed_to_wake`. Clients send their requests to the listen port.
@@ -152,11 +154,81 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 
 The dashboard API only accepts `POST` requests from its own origin.
 
+## Desktop tray
+
+A system tray / menu bar client talks to a running Switchyard over HTTP. The core server stays standard-library only; the tray is an optional extra.
+
+```sh
+python3 -m pip install 'switchyard[tray]'
+switchyard tray                          # or: python -m switchyard.tray
+switchyard tray --url http://127.0.0.1:8100
+```
+
+`SWITCHYARD_URL` overrides the default dashboard (`http://127.0.0.1:8100`, or `DASHBOARD_HOST`/`DASHBOARD_PORT` when set). The menu shows live GPU VRAM from `/gpu/status` (used/total, including older servers that only report free/total) and system RAM via psutil. Modes:
+
+- **Exclusive** — one owner at a time (today's default).
+- **Shared VRAM** — shown when the server advertises `shared_vram` (or a placement/budget field). Toggles that setting; hidden on older servers.
+- **Give GPU to** an engine (`POST /api/action` `warm`) or ComfyUI (`comfy_acquire`, falling back to `POST /gpu/acquire` on an engine listen port).
+- **Clear all** — sleeps every engine and unloads ComfyUI. Asks for confirmation when a dialog is available.
+
+**Open dashboard** uses the system browser. If the server is unreachable the icon turns red and the menu offers Retry.
+
+Local tray settings (`check_updates`, optional URL) live in `~/.config/switchyard/tray.json` (macOS: `~/Library/Application Support/switchyard/tray.json`, Windows: `%APPDATA%\switchyard\tray.json`). Override the path with `SWITCHYARD_TRAY_CONFIG`.
+
+### Linux caveats
+
+pystray prefers **AppIndicator**. GNOME Shell does not show app indicators unless you install an extension such as [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/). Without AppIndicator or GTK, pystray falls back to **Xorg**: the icon is visible but the menu is not (a left-click runs the default item, Open dashboard). Set `PYSTRAY_BACKEND=appindicator` to force that backend. Wayland sessions need AppIndicator or GTK; the Xorg backend will not work there.
+
+### Autostart
+
+**Linux.** A user systemd service or a desktop file:
+
+```ini
+# ~/.config/autostart/switchyard-tray.desktop
+[Desktop Entry]
+Type=Application
+Name=Switchyard
+Exec=switchyard tray
+X-GNOME-Autostart-enabled=true
+```
+
+```ini
+# ~/.config/systemd/user/switchyard-tray.service
+[Service]
+ExecStart=switchyard tray
+Restart=on-failure
+[Install]
+WantedBy=default.target
+```
+
+Then `systemctl --user enable --now switchyard-tray`.
+
+**macOS.** Save a LaunchAgent at `~/Library/LaunchAgents/com.switchyard.tray.plist` with `ProgramArguments` `switchyard` and `tray`, then `launchctl load` it. Or System Settings → General → Login Items.
+
+**Windows.** `Win+R`, `shell:startup`, and a shortcut to `switchyard-tray` (a GUI entry point, so no console window) or `switchyard tray`.
+
+The tray does not start the server. Start Switchyard first (Docker or `python3 -m switchyard`).
+
+## Updating
+
+```sh
+switchyard update            # show what's new; ask before installing
+switchyard update --yes      # print notes, then pip-install (never silent)
+```
+
+The check uses the standard library (`urllib`, `json`) against GitHub releases, then tags, of [dxbh0517/switchyard](https://github.com/dxbh0517/switchyard). No releases yet, being offline, and API rate limits are reported instead of crashing. Compared against the installed `__version__`.
+
+- **pip install** — after you confirm, upgrades from PyPI (`switchyard==X.Y.Z`) when that version is published, otherwise from the git tag.
+- **Docker / source** — notify only, with rebuild / `git pull` instructions. Nothing is installed automatically.
+
+The tray has a **Check for updates** item (same lookup, still confirms before installing). **Check periodically** is off by default; turn it on from the menu to poll GitHub at most once a day.
+
 ## Development
 
 ```sh
 python3 -m pip install -e .
-python3 -m unittest discover -s tests     # stdlib only; uses fake vLLM/ComfyUI/OVMS servers
+python3 -m unittest discover -s tests     # fake vLLM/ComfyUI/OVMS; tray/updater tests mock the network
+# Optional: python3 -m pip install -e ".[tray]"  — runs make_icon; pystray GUI is still skipped without Gtk
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, PR expectations, and [good first issues](https://github.com/dxbh0517/switchyard/labels/good%20first%20issue).

@@ -40,6 +40,11 @@ stt = [
   "transformers>=5.16.0",
   "numpy",
 ]
+tray = [
+  "pystray>=0.19",
+  "pillow>=10",
+  "psutil>=5.9",
+]
 dev = []
 
 [project.urls]
@@ -50,6 +55,9 @@ Changelog = "https://github.com/dxbh0517/switchyard/releases"
 
 [project.scripts]
 switchyard = "switchyard.__main__:main"
+
+[project.gui-scripts]
+switchyard-tray = "switchyard.tray:main"
 
 [tool.setuptools.packages.find]
 include = ["switchyard*"]
