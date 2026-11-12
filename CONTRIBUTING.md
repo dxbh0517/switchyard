@@ -10,6 +10,8 @@ cd switchyard
 python3 -m pip install -e .
 # Optional speech-to-text extras (needs ffmpeg on PATH):
 # python3 -m pip install -e ".[stt]"
+# Optional desktop tray (pystray + Pillow + psutil):
+# python3 -m pip install -e ".[tray]"
 ```
 
 Run without Docker:
@@ -23,7 +25,7 @@ Set `SWITCHYARD_SETTINGS` if you want the settings file somewhere other than the
 
 ## Tests
 
-Stdlib only — no GPU, no real vLLM/ComfyUI/OVMS required:
+Stdlib only for the server tests — no GPU, no real vLLM/ComfyUI/OVMS required. Tray/updater tests mock the network, the dashboard API, and pystray; GUI bits are skipped if `switchyard[tray]` is not installed:
 
 ```sh
 python3 -m unittest discover -s tests
@@ -42,7 +44,7 @@ Open an issue before large design changes so we can agree on direction.
 ## Pull requests
 
 1. Fork and branch from `main`.
-2. Keep the arbiter / OVMS shim / dashboard stdlib-only unless the change is clearly under the optional STT path.
+2. Keep the arbiter / OVMS shim / dashboard stdlib-only unless the change is clearly under an optional extra (`stt` or `tray`). The tray is a separate client of the HTTP API.
 3. Add or update tests for behavior changes.
 4. Run the test suite locally.
 5. Fill in the pull request template.
