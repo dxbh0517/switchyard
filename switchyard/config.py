@@ -44,7 +44,13 @@ FIELDS: list[Field] = [
                "restart; the free-VRAM target applies live."),
     Field("text_only_engines", "arbiter", "Text-only engines", "str", "qwen", "TEXT_ONLY_ENGINES",
           help="Comma-separated. Image parts sent to these engines are replaced with a note."),
-    Field("comfy_url", "arbiter", "ComfyUI URL", "str", "http://127.0.0.1:8188", "COMFY_URL"),
+    Field("comfy_url", "arbiter", "ComfyUI URL", "str", "http://127.0.0.1:8188", "COMFY_URL",
+          help="Queue, model unload, and last-resort VRAM probe via /system_stats."),
+    Field("gpu_probe", "arbiter", "VRAM probe", "choice", "auto", "GPU_PROBE",
+          choices=("auto", "nvml", "nvidia-smi", "comfy", "off"),
+          help="auto tries NVML, then nvidia-smi, then ComfyUI. off disables probing."),
+    Field("gpu_index", "arbiter", "GPU index", "int", 0, "GPU_INDEX", min=0,
+          help="Which NVIDIA GPU to read. Single-card hosts leave this at 0."),
     Field("listen_host", "arbiter", "Listen host", "str", "0.0.0.0", "LISTEN_HOST", live=False),
     Field("idle_sleep_sec", "arbiter", "Sleep after idle (s)", "int", 120, "IDLE_SLEEP_SEC", min=10,
           help="An awake engine with no traffic for this long goes back to sleep."),
@@ -109,7 +115,8 @@ def _coerce(f: Field, value):
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
-    if f.type in ("int", "choice"):
+    numeric_choice = f.type == "choice" and f.choices and isinstance(next(iter(f.choices)), int)
+    if f.type == "int" or numeric_choice:
         value = int(value)
     elif f.type == "float":
         value = float(value)

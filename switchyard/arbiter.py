@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import re
 import threading
 import time
 import urllib.request
@@ -26,6 +25,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .config import Settings
 from .events import Counters, log
+from .gpu import GpuProbe
 from .httputil import Handler, Server
 
 INFER_PREFIXES = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses",
@@ -77,7 +77,9 @@ class Arbiter:
             "loading_until": {e: 0.0 for e in names},
         }
         self.sleeping: dict = {e: None for e in names}      # polled, for the dashboard
-        self.gpu: dict = {"free_mb": None, "total_mb": None, "name": None}
+        self.probe = GpuProbe(settings)
+        self.gpu: dict = {"free_mb": None, "used_mb": None, "total_mb": None,
+                          "name": None, "source": "unknown", "index": settings.get("gpu_index")}
         self.comfy_queue: dict = {"running": None, "pending": None}
         self.stats = {e: Counters() for e in names}
         self.servers: list = []
@@ -136,6 +138,8 @@ class Arbiter:
     # ------------------------------------------------------------ engine power
     def wake(self, engine: str) -> None:
         if self.is_sleeping(engine):
+            if self.gpu_free_mb() is None:
+                log(C, f"waking {engine} with VRAM unknown", "warn")
             level = self.state["sleep_level"][engine]
             log(C, f"waking {engine} (from level {level})")
             t = time.time()
@@ -181,17 +185,9 @@ class Arbiter:
             return json.load(r)
 
     def gpu_free_mb(self) -> float | None:
-        try:
-            devs = self._comfy_get("/system_stats").get("devices", [])
-            cuda = [d for d in devs if d.get("type") == "cuda"] or devs
-            if not cuda:
-                return None
-            self.gpu.update(free_mb=round(cuda[0]["vram_free"] / 2**20),
-                            total_mb=round(cuda[0]["vram_total"] / 2**20),
-                            name=re.sub(r"^cuda:\d+\s+", "", cuda[0].get("name", "").split(" : ")[0]))
-            return cuda[0]["vram_free"] / 2**20
-        except Exception:
-            return None
+        self.gpu = self.probe.read().as_dict()
+        free = self.gpu.get("free_mb")
+        return None if free is None else float(free)
 
     def comfy_running(self) -> bool | None:
         try:
@@ -214,12 +210,17 @@ class Arbiter:
             urllib.request.urlopen(req, timeout=5).read()
         except Exception as e:
             log(C, f"ComfyUI /free skipped: {e}")
+            if self.gpu_free_mb() is None:
+                log(C, "VRAM unknown; proceeding without a free-memory check", "warn")
             return
         deadline = time.time() + self.s.get("comfy_free_wait_sec")
         free, t = None, time.time()
         while time.time() < deadline:
             free = self.gpu_free_mb()
-            if free is None or free >= target_mb:
+            if free is None:
+                log(C, "VRAM unknown after ComfyUI unload; proceeding without a free-memory check", "warn")
+                break
+            if free >= target_mb:
                 break
             time.sleep(0.25)
         log(C, f"ComfyUI unloaded in {time.time() - t:.1f}s (GPU free {free and round(free)} MiB, want {target_mb})")
