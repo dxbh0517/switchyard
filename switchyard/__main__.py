@@ -12,6 +12,9 @@ from .events import log
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "ctl":
+        from .ctl import main as ctl_main
+        raise SystemExit(ctl_main(sys.argv[2:], prog="switchyard ctl"))
     settings = Settings()
     log("switchyard", f"v{__version__}, settings file {settings.path}")
     components: dict = {"arbiter": None, "ovms": None, "stt": None}

@@ -50,6 +50,7 @@ Changelog = "https://github.com/dxbh0517/switchyard/releases"
 
 [project.scripts]
 switchyard = "switchyard.__main__:main"
+switchyardctl = "switchyard.ctl:main"
 
 [tool.setuptools.packages.find]
 include = ["switchyard*"]
