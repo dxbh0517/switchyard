@@ -40,8 +40,8 @@ FIELDS: list[Field] = [
     Field("arbiter_enabled", "arbiter", "Enabled", "bool", True, "ARBITER_ENABLED", live=False),
     Field("engines", "arbiter", "Engines", "engines",
           "qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500", "ENGINES", live=False,
-          help="vLLM engines sharing the GPU. Name, backend and listen port changes need a "
-               "restart; the free-VRAM target applies live."),
+          help="vLLM engines sharing the GPU. name=host:port@listen:free_mb[:vram_mb]. "
+               "Name, backend and listen port changes need a restart; free_mb and vram_mb apply live."),
     Field("text_only_engines", "arbiter", "Text-only engines", "str", "qwen", "TEXT_ONLY_ENGINES",
           help="Comma-separated. Image parts sent to these engines are replaced with a note."),
     Field("comfy_url", "arbiter", "ComfyUI URL", "str", "http://127.0.0.1:8188", "COMFY_URL"),
@@ -55,6 +55,15 @@ FIELDS: list[Field] = [
           "COMFY_FREE_WAIT_SEC", min=0),
     Field("loading_max_sec", "arbiter", "Engine startup claim (s)", "int", 900, "LOADING_MAX_SEC", min=60,
           help="How long a starting engine may hold the GPU before its claim expires."),
+    Field("shared_vram", "arbiter", "Shared VRAM", "bool", False, "SHARED_VRAM",
+          help="Off (default): one occupant at a time. On: keep several engines awake while "
+               "their VRAM costs fit the budget; evict least-recently used when a wake would not fit. "
+               "Inference is still one engine at a time. ComfyUI still takes the whole GPU."),
+    Field("vram_budget_mb", "arbiter", "VRAM budget (MiB)", "int", 0, "VRAM_BUDGET_MB", min=0,
+          help="Card size used for shared placement. 0 = use the total VRAM ComfyUI reports."),
+    Field("vram_safety_mb", "arbiter", "VRAM safety margin (MiB)", "int", 1024, "VRAM_SAFETY_MB", min=0,
+          help="Headroom left unused so a wake or a ComfyUI prompt does not OOM. "
+               "Usable budget is vram_budget_mb minus this."),
     # OVMS shim -----------------------------------------------------------------
     Field("ovms_enabled", "ovms", "Enabled", "bool", True, "OVMS_SHIM_ENABLED", live=False),
     Field("ovms_port", "ovms", "Listen port", "int", 8012, "OVMS_SHIM_PORT", live=False),
@@ -81,15 +90,20 @@ BY_KEY = {f.key: f for f in FIELDS}
 
 # ------------------------------------------------------------------ engines spec
 def parse_engines(spec: str | list) -> list[dict]:
-    """'name=host:port@listen:free_mb,...' -> [{name, backend, listen, free_mb}]"""
+    """'name=host:port@listen:free_mb[:vram_mb],...' -> [{name, backend, listen, free_mb, ...}]"""
     if isinstance(spec, list):
         return [dict(e) for e in spec]
     out = []
     for item in filter(None, (s.strip() for s in spec.split(","))):
         name, rest = item.split("=", 1)
         backend, rest = rest.split("@", 1)
-        listen, free_mb = (rest.split(":", 1) + ["0"])[:2]
-        out.append({"name": name, "backend": backend, "listen": int(listen), "free_mb": int(free_mb)})
+        parts = rest.split(":")
+        listen = int(parts[0])
+        free_mb = int(parts[1] if len(parts) > 1 and parts[1] else 0)
+        row = {"name": name, "backend": backend, "listen": listen, "free_mb": free_mb}
+        if len(parts) > 2 and parts[2]:
+            row["vram_mb"] = int(parts[2])
+        out.append(row)
     return out
 
 
@@ -104,6 +118,12 @@ def _coerce(f: Field, value):
                 raise ValueError(f"bad engine entry: {e}")
             seen.add(name)
             e.update(name=name, listen=int(e["listen"]), free_mb=int(e.get("free_mb") or 0))
+            for k in ("vram_mb", "n_params", "n_layers", "n_kv_heads", "head_dim",
+                      "hidden_size", "context_length"):
+                if e.get(k) not in (None, ""):
+                    e[k] = int(float(e[k]))
+            if e.get("quant"):
+                e["quant"] = str(e["quant"])
         return engines
     if f.type == "bool":
         if isinstance(value, str):
