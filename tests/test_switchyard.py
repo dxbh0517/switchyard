@@ -4,6 +4,9 @@ The arbiter tests run against fake vLLM engines and a fake ComfyUI on localhost.
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import json
 import os
 import socket
@@ -14,11 +17,11 @@ import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
-from switchyard import config
+from switchyard import __version__, config
 from switchyard.arbiter import Arbiter, strip_images
 from switchyard.httputil import Server
 from switchyard.ovms_shim import OvmsShim, StreamThinkFilter, split_think
-from switchyard.stt import parse_multipart
+from switchyard.stt import Stt, parse_multipart
 
 
 def free_port() -> int:
@@ -145,6 +148,22 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 s.update({"nope": 1})
 
+    def test_reset_creates_parent_and_drops_saved_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "nested", "s.json")
+            s = config.Settings(path)
+            s.update({"idle_sleep_sec": 45, "stt_port": 9999})
+            os.remove(path)
+            os.rmdir(os.path.dirname(path))
+            r = s.reset("idle_sleep_sec")
+            self.assertEqual(r, {"reset": "idle_sleep_sec"})
+            self.assertTrue(os.path.isfile(path))
+            self.assertFalse(os.path.exists(os.path.join(d, "nested", "s.tmp")))
+            with open(path) as f:
+                saved = json.loads(f.read())
+            self.assertNotIn("idle_sleep_sec", saved)
+            self.assertEqual(saved["stt_port"], 9999)
+
 
 class HelperTests(unittest.TestCase):
     def test_strip_images(self):
@@ -266,7 +285,8 @@ class OvmsShimTests(unittest.TestCase):
             up, port = serve(H)
             s = config.Settings(os.path.join(d, "s.json"))
             shim_port = free_port()
-            s.update({"ovms_upstream": f"http://127.0.0.1:{port}", "ovms_port": shim_port})
+            s.update({"ovms_upstream": f"http://127.0.0.1:{port}", "ovms_port": shim_port,
+                      "listen_host": "127.0.0.1"})
             shim = OvmsShim(s)
             shim.start()
             time.sleep(0.2)
@@ -277,8 +297,71 @@ class OvmsShimTests(unittest.TestCase):
                      {"query": "q", "documents": ["d"], "return_documents": True})
             self.assertEqual(r["results"][0]["document"]["text"], "d")
             self.assertIn("<Document>: d", seen["/v3/rerank"]["documents"][0])
+            shim.server.shutdown()
+            shim.server.server_close()
             up.shutdown()
             up.server_close()
+
+    def test_honors_listen_host(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = config.Settings(os.path.join(d, "s.json"))
+            port = free_port()
+            s.update({"listen_host": "127.0.0.1", "ovms_port": port})
+            shim = OvmsShim(s)
+            shim.start()
+            try:
+                self.assertEqual(shim.server.server_address[0], "127.0.0.1")
+                self.assertEqual(shim.server.server_address[1], port)
+            finally:
+                shim.server.shutdown()
+                shim.server.server_close()
+
+
+class SttBindTests(unittest.TestCase):
+    def test_honors_listen_host(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = config.Settings(os.path.join(d, "s.json"))
+            port = free_port()
+            s.update({"listen_host": "127.0.0.1", "stt_port": port, "stt_model_path": os.path.join(d, "no-model")})
+            stt = Stt(s)
+            stt.reload = lambda: None
+            stt.start()
+            try:
+                self.assertEqual(stt.server.server_address[0], "127.0.0.1")
+                self.assertEqual(stt.server.server_address[1], port)
+            finally:
+                stt.server.shutdown()
+                stt.server.server_close()
+
+
+class CliTests(unittest.TestCase):
+    def test_help_lists_settings_and_dashboard_warning(self):
+        from switchyard.__main__ import main
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            main(["--help"])
+        self.assertEqual(cm.exception.code, 0)
+        out = buf.getvalue()
+        self.assertIn("SWITCHYARD_SETTINGS", out)
+        self.assertIn("ARBITER_ENABLED", out)
+        self.assertIn("STT_ENABLED", out)
+        self.assertIn("DASHBOARD_HOST", out)
+        self.assertIn("no auth", out)
+        self.assertIn("localhost", out)
+        self.assertIn(__version__, out)
+
+    def test_version(self):
+        from switchyard.__main__ import main
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            main(["--version"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn(__version__, buf.getvalue())
+
+    def test_no_args_does_not_exit(self):
+        from switchyard.__main__ import _parser
+        ns = _parser().parse_args([])
+        self.assertEqual(ns, argparse.Namespace())
 
 
 if __name__ == "__main__":

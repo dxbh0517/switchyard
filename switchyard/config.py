@@ -182,10 +182,7 @@ class Settings:
             old = {k: self._values[k] for k in clean}
             self._values.update(clean)
             self.saved.update(clean)
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.saved, indent=2))
-            tmp.replace(self.path)
+            self._persist()
         changed = {k: v for k, v in clean.items() if old[k] != v}
         for fn in self._listeners:
             try:
@@ -194,9 +191,16 @@ class Settings:
                 pass
         return {"changed": sorted(changed), "restart_pending": self.restart_pending()}
 
+    def _persist(self) -> None:
+        """Write saved values: create the parent dir and replace via a temp file."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.saved, indent=2))
+        tmp.replace(self.path)
+
     def reset(self, key: str) -> dict:
         """Forget a saved override (falls back to env/default after restart)."""
         with self._lock:
             self.saved.pop(key, None)
-            self.path.write_text(json.dumps(self.saved, indent=2))
+            self._persist()
         return {"reset": key}
