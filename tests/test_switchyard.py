@@ -14,11 +14,14 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
+from pathlib import Path
 
 from switchyard import __version__, config, events
 from switchyard.arbiter import Arbiter, strip_images
+from switchyard.dashboard import Dashboard
 from switchyard.httputil import Server
 from switchyard.ovms_shim import OvmsShim, StreamThinkFilter, split_think
 from switchyard.stt import Stt, parse_multipart
@@ -123,7 +126,20 @@ def fake_comfy():
 class ConfigTests(unittest.TestCase):
     def test_parse_engines(self):
         e = config.parse_engines("qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500")
-        self.assertEqual(e[1], {"name": "vision", "backend": "127.0.0.1:8003", "listen": 8005, "free_mb": 17500})
+        self.assertEqual(e[1], {"name": "vision", "backend": "127.0.0.1:8003", "listen": 8005,
+                                "free_mb": 17500, "enabled": True, "boot": False})
+        flags = config.parse_engines("qwen=127.0.0.1:8002@8000:21400:boot,vision=127.0.0.1:8003@8005:17500:off")
+        self.assertTrue(flags[0]["boot"] and flags[0]["enabled"])
+        self.assertFalse(flags[1]["enabled"])
+        extra = config.parse_engines("qwen=127.0.0.1:8002@8000:21400:18000:boot")  # extra int reserved
+        self.assertEqual(extra[0]["free_mb"], 21400)
+        self.assertTrue(extra[0]["boot"])
+        kept = config.parse_engines([{"name": "a", "backend": "127.0.0.1:1", "listen": 2,
+                                      "free_mb": 3, "vram_mb": 9000, "quant": "q4_k"}])
+        self.assertEqual(kept[0]["vram_mb"], 9000)
+        self.assertEqual(kept[0]["quant"], "q4_k")
+        self.assertTrue(kept[0]["enabled"])
+        self.assertFalse(kept[0]["boot"])
 
     def test_env_file_precedence_and_restart_flag(self):
         with tempfile.TemporaryDirectory() as d:
@@ -152,6 +168,14 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(s.get("gpu_index"), 1)
             with self.assertRaises(ValueError):
                 s.update({"gpu_probe": "cuda"})
+            with self.assertRaises(ValueError):
+                s.update({"engines": "a=127.0.0.1:1@2:3:nope"})
+            with self.assertRaises(ValueError):
+                s.update({"engines": "a=127.0.0.1:1@2:3:boot,b=127.0.0.1:3@4:5:boot"})
+            r = s.update({"engines": "a=127.0.0.1:1@2:3:boot,b=127.0.0.1:3@4:5:off"})
+            self.assertIn("engines", r["changed"])
+            self.assertTrue(s.get("engines")[0]["boot"])
+            self.assertFalse(s.get("engines")[1]["enabled"])
 
     def test_reset_creates_parent_and_drops_saved_key(self):
         with tempfile.TemporaryDirectory() as d:
@@ -279,6 +303,32 @@ class ArbiterTests(unittest.TestCase):
         self.assertEqual(st["gpu"]["source"], "off")
         self.assertIsNone(st["gpu"]["free_mb"])
 
+    def test_boot_load_wakes_marked_engine(self):
+        engines = json.loads(json.dumps(self.arb.s.get("engines")))
+        engines[0]["boot"] = True
+        self.arb.s.update({"engines": engines})
+        self.assertTrue(self.a_state["sleeping"])
+        self.arb.on_backend_ready("a")
+        self.assertFalse(self.a_state["sleeping"])
+        self.assertEqual(self.arb.state["owner"], "a")
+        st = get(f"http://127.0.0.1:{self.la}/gpu/status")
+        self.assertTrue(st["engines"]["a"]["boot"])
+        self.assertEqual(st["engines"]["a"]["state"], "awake")
+
+    def test_backend_ready_parks_without_boot(self):
+        self.arb.on_backend_ready("a")
+        self.assertTrue(self.a_state["sleeping"])
+        self.assertIsNone(self.arb.state["owner"])
+
+    def test_disabled_live_refuses_wake(self):
+        engines = json.loads(json.dumps(self.arb.s.get("engines")))
+        engines[0]["enabled"] = False
+        self.arb.s.update({"engines": engines})
+        with self.assertRaises(RuntimeError):
+            self.arb.engine_enter("a")
+        with self.assertRaises(ValueError):
+            self.arb.action("warm", "a")
+
 
 class OvmsShimTests(unittest.TestCase):
     def test_adds_id_and_wraps_rerank(self):
@@ -383,6 +433,147 @@ class CliTests(unittest.TestCase):
         from switchyard.__main__ import _parser
         ns = _parser().parse_args([])
         self.assertEqual(ns, argparse.Namespace())
+
+
+class EngineSetupTests(unittest.TestCase):
+    """Disabled engines are not bound; boot-load runs when the backend comes up."""
+
+    def tearDown(self):
+        for srv in getattr(self, "servers", []):
+            srv.shutdown()
+            srv.server_close()
+        if getattr(self, "tmp", None):
+            self.tmp.cleanup()
+
+    def _start(self, spec, **extra):
+        self.tmp = tempfile.TemporaryDirectory()
+        a_state, ha = fake_engine()
+        b_state, hb = fake_engine()
+        c_state, hc = fake_comfy()
+        served = [serve(ha), serve(hb), serve(hc)]
+        (_, pa), (_, pb), (_, pc) = served
+        self.la, self.lb = free_port(), free_port()
+        s = config.Settings(os.path.join(self.tmp.name, "s.json"))
+        s.update({"engines": spec.format(pa=pa, pb=pb, la=self.la, lb=self.lb),
+                  "comfy_url": f"http://127.0.0.1:{pc}", "listen_host": "127.0.0.1",
+                  "gpu_probe": "comfy", **extra})
+        self.arb = Arbiter(s)
+        self.arb.start()
+        self.servers = [srv for srv, _ in served] + self.arb.servers
+        self.a_state, self.b_state = a_state, b_state
+        time.sleep(0.3)
+        return s
+
+    def test_disabled_engine_is_not_bound(self):
+        self._start("a=127.0.0.1:{pa}@{la}:1000,b=127.0.0.1:{pb}@{lb}:1000:off")
+        self.assertIn("a", self.arb.engines)
+        self.assertNotIn("b", self.arb.engines)
+        self.assertEqual(len(self.arb.servers), 1)
+        st = get(f"http://127.0.0.1:{self.la}/gpu/status")
+        self.assertEqual(st["engines"]["b"]["state"], "disabled")
+        self.assertFalse(st["engines"]["b"]["enabled"])
+        with self.assertRaises(urllib.error.URLError):
+            get(f"http://127.0.0.1:{self.lb}/gpu/status")
+        post(f"http://127.0.0.1:{self.la}/v1/chat/completions",
+             {"messages": [{"role": "user", "content": "hi"}]})
+        self.assertFalse(self.a_state["sleeping"])
+
+    def test_boot_flag_wakes_on_startup(self):
+        self._start("a=127.0.0.1:{pa}@{la}:1000:boot,b=127.0.0.1:{pb}@{lb}:1000")
+        deadline = time.time() + 2
+        while time.time() < deadline and self.a_state["sleeping"]:
+            time.sleep(0.05)
+        self.assertFalse(self.a_state["sleeping"])
+        self.assertTrue(self.b_state["sleeping"])
+        self.assertEqual(self.arb.state["owner"], "a")
+
+
+class DashboardTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.port = free_port()
+        self.s = config.Settings(os.path.join(self.tmp.name, "s.json"))
+        self.s.update({"dashboard_host": "127.0.0.1", "dashboard_port": self.port,
+                       "engines": "qwen=127.0.0.1:8002@8000:21400:boot,vision=127.0.0.1:8003@8005:17500"})
+        self.arb = _FakeArbiter()
+        self.dash = Dashboard(self.s, {"arbiter": self.arb, "ovms": None, "stt": None})
+        self.dash.start()
+        time.sleep(0.15)
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def tearDown(self):
+        self.dash.server.shutdown()
+        self.dash.server.server_close()
+        self.tmp.cleanup()
+
+    def test_binds_localhost(self):
+        self.assertEqual(self.dash.server.server_address[0], "127.0.0.1")
+
+    def test_status_and_settings_schema(self):
+        st = get(self.base + "/api/status")
+        self.assertEqual(st["arbiter"]["owner"], None)
+        self.assertTrue(st["arbiter"]["engines"]["qwen"]["boot"])
+        schema = get(self.base + "/api/settings")
+        self.assertIn("engines", schema["sections"])
+        self.assertIn("switching", schema["sections"])
+        self.assertIn("vram", schema["sections"])
+        qwen = next(e for e in schema["values"]["engines"] if e["name"] == "qwen")
+        self.assertTrue(qwen["boot"] and qwen["enabled"])
+        self.assertEqual(schema["values"]["dashboard_host"], "127.0.0.1")
+        html = urllib.request.urlopen(self.base + "/", timeout=5).read()
+        self.assertIn(b'data-f="boot"', html)
+        self.assertIn(b"sec-h", html)
+
+    def test_settings_persist_and_validate(self):
+        engines = [{"name": "qwen", "backend": "127.0.0.1:8002", "listen": 8000,
+                    "free_mb": 20000, "enabled": True, "boot": False, "vram_mb": 9000},
+                   {"name": "vision", "backend": "127.0.0.1:8003", "listen": 8005,
+                    "free_mb": 17500, "enabled": False, "boot": False}]
+        r = post(self.base + "/api/settings", {"engines": engines, "idle_sleep_sec": 45,
+                                               "gpu_probe": "nvidia-smi", "gpu_index": 1})
+        self.assertIn("engines", r["changed"])
+        saved = json.loads(Path(self.s.path).read_text())
+        self.assertEqual(saved["idle_sleep_sec"], 45)
+        self.assertEqual(saved["engines"][0]["vram_mb"], 9000)
+        self.assertFalse(saved["engines"][1]["enabled"])
+        self.assertFalse(os.path.exists(str(self.s.path) + ".tmp") or
+                         os.path.exists(str(self.s.path.with_suffix(".tmp"))))
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            post(self.base + "/api/settings",
+                 {"engines": "a=127.0.0.1:1@2:3:boot,b=127.0.0.1:3@4:5:boot"})
+        self.assertEqual(cm.exception.code, 400)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            post(self.base + "/api/settings", {"sleep_level": 9})
+        self.assertEqual(cm.exception.code, 400)
+
+    def test_action_and_cross_origin_refused(self):
+        r = post(self.base + "/api/action", {"component": "arbiter", "action": "warm", "target": "qwen"})
+        self.assertEqual(r["result"], "started")
+        self.assertEqual(self.arb.actions[-1], ("warm", "qwen"))
+        req = urllib.request.Request(self.base + "/api/settings", data=b"{}", method="POST",
+                                     headers={"Content-Type": "application/json",
+                                              "Origin": "http://evil.example", "Host": f"127.0.0.1:{self.port}"})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(cm.exception.code, 403)
+
+
+class _FakeArbiter:
+    def __init__(self):
+        self.actions = []
+
+    def status(self):
+        return {"owner": None, "comfy_active": 0, "comfy_queue": {"running": 0, "pending": 0},
+                "gpu": {"name": "Fake GPU", "free_mb": 20000, "used_mb": 4000, "total_mb": 24000,
+                        "source": "nvml", "index": 0},
+                "engines": {"qwen": {"listen": 8000, "backend": "127.0.0.1:8002", "free_mb": 21400,
+                                     "text_only": True, "state": "asleep", "inflight": 0, "idle_sec": 0,
+                                     "enabled": True, "boot": True, "requests": 0, "wakes": 0}},
+                "idle_sleep_sec": 120}
+
+    def action(self, name, target=None):
+        self.actions.append((name, target))
+        return "started"
 
 
 if __name__ == "__main__":
