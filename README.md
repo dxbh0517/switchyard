@@ -13,7 +13,7 @@ Share one NVIDIA GPU between several local AI services without them fighting ove
   - moves stray `</think>` text out of answers
   - maps `/v1` paths to `/v3`
 - **Speech to text.** An OpenAI-compatible `/v1/audio/transcriptions` endpoint on the CPU. It uses Granite Speech CTC models through 🤗 Transformers.
-- **Dashboard.** Shows the live state of the parts above and lets you edit their settings.
+- **Dashboard.** Live status (owner, VRAM, wake/sleep) plus the settings that control the stack: which engines are on, which one loads on boot, and the switching knobs. Localhost only; there is no login.
 
 ![Dashboard](docs/dashboard.png)
 
@@ -33,7 +33,8 @@ ComfyUI ──► POST /gpu/acquire ──────┘                   put 
   - Level 2 drops the weights and reloads them from disk (the page cache when warm). Each sleeping engine keeps under 1 GiB of VRAM.
   - Level 1 keeps the weights in CPU RAM instead.
 - **ComfyUI jobs:** the hook in [`comfyui_node/`](comfyui_node/gpu_arbiter) calls `/gpu/acquire` before each prompt and `/gpu/release` after it. If Switchyard can't be reached, ComfyUI runs normally.
-- **Engine startup:** an engine container calls `POST /gpu/loading?engine=NAME` before it starts `vllm serve`. Loads are serialized, and each engine is put to sleep as soon as it is up.
+- **Engine startup:** an engine container calls `POST /gpu/loading?engine=NAME` before it starts `vllm serve`. Loads are serialized. Engines marked **boot** in the dashboard (or `:boot` in `ENGINES`) are woken once they are up; the rest stay parked until a request or a manual Wake.
+- **Availability:** an engine with **On** unchecked (or `:off` in `ENGINES`) is not bound and is not woken. Apply that change with a restart.
 - **Text-only engines:** image parts in requests to a text-only engine are replaced with a short note, so the request doesn't fail with HTTP 400.
 - **VRAM:** free/used/total are read from the GPU when possible (NVML, then `nvidia-smi`), with ComfyUI `/system_stats` as a fallback. `/gpu/status` and the dashboard show the reading and which source produced it. If nothing can be read, wake and unload log a warning and continue.
 
@@ -74,7 +75,7 @@ python3 -m switchyard            # start; same as the `switchyard` console scrip
 # Optional NVML VRAM probe: python3 -m pip install -e ".[nvml]"
 ```
 
-`ENGINES` is a comma-separated list of `name=backend_host:port@listen_port:free_MiB_needed_to_wake`. Clients send their requests to the listen port.
+`ENGINES` is a comma-separated list of `name=backend_host:port@listen_port:free_MiB_needed_to_wake[:flag…]`. Optional flags: `boot` (wake this engine when Switchyard starts; at most one On engine) and `off` (do not bind or wake it). Clients send their requests to the listen port. The dashboard Engines table edits the same list.
 
 The vLLM engines must run with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1`, which exposes `/sleep`, `/wake_up` and `/collective_rpc`. To have an engine claim the GPU before it loads, use an entrypoint like this one:
 
@@ -103,7 +104,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | Variable | Default | Applies | Description |
 |---|---|---|---|
 | `ARBITER_ENABLED` | `true` | restart | Turns the arbiter on or off. |
-| `ENGINES` | `qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500` | restart | The vLLM engines sharing the GPU. The free-VRAM target applies live. |
+| `ENGINES` | `qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500` | restart | The vLLM engines sharing the GPU. Optional `:boot` / `:off`. Free-VRAM target applies live; on/off and boot need a restart. |
 | `TEXT_ONLY_ENGINES` | `qwen` | live | Comma-separated. Image parts sent to these engines are replaced with a note. |
 | `COMFY_URL` | `http://127.0.0.1:8188` | live | ComfyUI address. Used to check the queue, unload models, and as a fallback VRAM probe. |
 | `GPU_PROBE` | `auto` | live | How to read VRAM: `auto` (NVML → nvidia-smi → ComfyUI), or force `nvml` / `nvidia-smi` / `comfy`, or `off`. |
@@ -155,7 +156,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | `STT_PORT` | `POST /v1/audio/transcriptions`, `GET /v1/models`, `/health` | speech to text |
 | `DASHBOARD_PORT` | `/`, `/api/status`, `/api/settings`, `/api/action`, `/api/logs`, `/api/restart` | dashboard |
 
-The dashboard API only accepts `POST` requests from its own origin.
+The dashboard API only accepts `POST` requests from its own origin. `GET /api/settings` includes `sections` (Engines, Switching & swapping, VRAM probe) so later knobs can land in the same page without a new UI. Engine entries may carry extra keys (ignored here) for a later memory-budget change.
 
 ## Development
 

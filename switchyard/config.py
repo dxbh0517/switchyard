@@ -26,6 +26,7 @@ class Field:
     choices: tuple = ()
     min: float | None = None
     max: float | None = None
+    section: str = ""    # optional heading inside a group; unknown sections just render their key
 
 
 GROUPS = {
@@ -35,32 +36,48 @@ GROUPS = {
     "dashboard": "Dashboard",
 }
 
+# Headings inside a settings group. A later memory-budget PR can add "budget" here.
+SECTIONS = {
+    "engines": "Engines",
+    "switching": "Switching & swapping",
+    "vram": "VRAM probe",
+}
+
 FIELDS: list[Field] = [
     # GPU arbiter ---------------------------------------------------------------
     Field("arbiter_enabled", "arbiter", "Enabled", "bool", True, "ARBITER_ENABLED", live=False),
+    Field("listen_host", "arbiter", "Listen host", "str", "0.0.0.0", "LISTEN_HOST", live=False),
     Field("engines", "arbiter", "Engines", "engines",
           "qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500", "ENGINES", live=False,
-          help="vLLM engines sharing the GPU. Name, backend and listen port changes need a "
-               "restart; the free-VRAM target applies live."),
+          help="On/off, boot, name, backend and listen need a restart; free MiB applies live. "
+               "At most one On engine may load on boot. Optional ENGINES flags: :boot, :off.",
+          section="engines"),
     Field("text_only_engines", "arbiter", "Text-only engines", "str", "qwen", "TEXT_ONLY_ENGINES",
-          help="Comma-separated. Image parts sent to these engines are replaced with a note."),
+          help="Comma-separated. Image parts sent to these engines are replaced with a note.",
+          section="engines"),
+    Field("idle_sleep_sec", "arbiter", "Sleep after idle (s)", "int", 120, "IDLE_SLEEP_SEC", min=10,
+          help="An awake engine with no traffic for this long goes back to sleep.",
+          section="switching"),
+    Field("sleep_level", "arbiter", "Sleep level", "choice", 2, "SLEEP_LEVEL", choices=(1, 2),
+          help="1 keeps weights in CPU RAM (fast wake, uses RAM). 2 drops them (reload from disk).",
+          section="switching"),
+    Field("wake_attempts", "arbiter", "Wake attempts", "int", 3, "WAKE_ATTEMPTS", min=1, max=10,
+          section="switching"),
+    Field("comfy_free_wait_sec", "arbiter", "Wait for ComfyUI unload (s)", "float", 30.0,
+          "COMFY_FREE_WAIT_SEC", min=0, section="switching"),
+    Field("loading_max_sec", "arbiter", "Engine startup claim (s)", "int", 900, "LOADING_MAX_SEC", min=60,
+          help="How long a starting engine may hold the GPU before its claim expires.",
+          section="switching"),
     Field("comfy_url", "arbiter", "ComfyUI URL", "str", "http://127.0.0.1:8188", "COMFY_URL",
-          help="Queue, model unload, and last-resort VRAM probe via /system_stats."),
+          help="Queue, model unload, and last-resort VRAM probe via /system_stats.",
+          section="switching"),
     Field("gpu_probe", "arbiter", "VRAM probe", "choice", "auto", "GPU_PROBE",
           choices=("auto", "nvml", "nvidia-smi", "comfy", "off"),
-          help="auto tries NVML, then nvidia-smi, then ComfyUI. off disables probing."),
+          help="auto tries NVML, then nvidia-smi, then ComfyUI. off disables probing.",
+          section="vram"),
     Field("gpu_index", "arbiter", "GPU index", "int", 0, "GPU_INDEX", min=0,
-          help="Which NVIDIA GPU to read. Single-card hosts leave this at 0."),
-    Field("listen_host", "arbiter", "Listen host", "str", "0.0.0.0", "LISTEN_HOST", live=False),
-    Field("idle_sleep_sec", "arbiter", "Sleep after idle (s)", "int", 120, "IDLE_SLEEP_SEC", min=10,
-          help="An awake engine with no traffic for this long goes back to sleep."),
-    Field("sleep_level", "arbiter", "Sleep level", "choice", 2, "SLEEP_LEVEL", choices=(1, 2),
-          help="1 keeps weights in CPU RAM (fast wake, uses RAM). 2 drops them (reload from disk)."),
-    Field("wake_attempts", "arbiter", "Wake attempts", "int", 3, "WAKE_ATTEMPTS", min=1, max=10),
-    Field("comfy_free_wait_sec", "arbiter", "Wait for ComfyUI unload (s)", "float", 30.0,
-          "COMFY_FREE_WAIT_SEC", min=0),
-    Field("loading_max_sec", "arbiter", "Engine startup claim (s)", "int", 900, "LOADING_MAX_SEC", min=60,
-          help="How long a starting engine may hold the GPU before its claim expires."),
+          help="Which NVIDIA GPU to read. Single-card hosts leave this at 0.",
+          section="vram"),
     # OVMS shim -----------------------------------------------------------------
     Field("ovms_enabled", "ovms", "Enabled", "bool", True, "OVMS_SHIM_ENABLED", live=False),
     Field("ovms_port", "ovms", "Listen port", "int", 8012, "OVMS_SHIM_PORT", live=False),
@@ -86,30 +103,84 @@ BY_KEY = {f.key: f for f in FIELDS}
 
 
 # ------------------------------------------------------------------ engines spec
+# :boot / :off (and :park / :on) after free_mb. Extra integers are ignored so a
+# later vram_mb field can land without breaking this parser.
+_ENGINE_FLAGS = {"boot": ("boot", True), "park": ("boot", False),
+                 "off": ("enabled", False), "on": ("enabled", True)}
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _normalize_engine(raw) -> dict:
+    if not isinstance(raw, dict):
+        raise ValueError(f"bad engine entry: {raw}")
+    e = dict(raw)  # keep unknown keys (vram_mb, quant, …) for a later budget PR
+    e["name"] = str(e.get("name", "")).strip()
+    e["backend"] = str(e.get("backend", "")).strip()
+    e["listen"] = int(e.get("listen") or 0)
+    e["free_mb"] = int(e.get("free_mb") or 0)
+    e["enabled"] = _as_bool(e.get("enabled", True), True)
+    e["boot"] = _as_bool(e.get("boot", False), False)
+    return e
+
+
 def parse_engines(spec: str | list) -> list[dict]:
-    """'name=host:port@listen:free_mb,...' -> [{name, backend, listen, free_mb}]"""
+    """'name=host:port@listen:free_mb[:flag...],...' -> engine dicts."""
     if isinstance(spec, list):
-        return [dict(e) for e in spec]
+        return [_normalize_engine(e) for e in spec]
     out = []
     for item in filter(None, (s.strip() for s in spec.split(","))):
         name, rest = item.split("=", 1)
         backend, rest = rest.split("@", 1)
-        listen, free_mb = (rest.split(":", 1) + ["0"])[:2]
-        out.append({"name": name, "backend": backend, "listen": int(listen), "free_mb": int(free_mb)})
+        parts = rest.split(":")
+        listen = int(parts[0])
+        free_mb, flags = 0, []
+        if len(parts) > 1:
+            try:
+                free_mb = int(parts[1])
+                flags = parts[2:]
+            except ValueError:
+                flags = parts[1:]
+        entry = {"name": name, "backend": backend, "listen": listen, "free_mb": free_mb,
+                 "enabled": True, "boot": False}
+        for tok in flags:
+            t = tok.strip().lower()
+            if not t:
+                continue
+            if t in _ENGINE_FLAGS:
+                key, val = _ENGINE_FLAGS[t]
+                entry[key] = val
+                continue
+            try:
+                int(t)  # reserved numeric slot (e.g. future vram_mb)
+            except ValueError:
+                raise ValueError(f"unknown engine flag {tok!r}") from None
+        out.append(entry)
     return out
 
 
 def _coerce(f: Field, value):
     if f.type == "engines":
         engines = parse_engines(value)
-        seen = set()
+        seen, boots = set(), []
         for e in engines:
-            name = str(e.get("name", "")).strip()
+            name = e["name"]
             host, _, port = str(e.get("backend", "")).rpartition(":")
             if not name or name in seen or not host or not port.isdigit():
                 raise ValueError(f"bad engine entry: {e}")
+            if e["free_mb"] < 0:
+                raise ValueError(f"{name}: free_mb must be >= 0")
             seen.add(name)
-            e.update(name=name, listen=int(e["listen"]), free_mb=int(e.get("free_mb") or 0))
+            if e["enabled"] and e["boot"]:
+                boots.append(name)
+        if len(boots) > 1:
+            raise ValueError(f"at most one enabled engine may load on boot, got {boots}")
         return engines
     if f.type == "bool":
         if isinstance(value, str):
@@ -170,6 +241,7 @@ class Settings:
             values = json.loads(json.dumps(self._values))
         return {
             "groups": GROUPS,
+            "sections": SECTIONS,
             "fields": [asdict(f) for f in FIELDS],
             "values": values,
             "restart_pending": self.restart_pending(),

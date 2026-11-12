@@ -53,6 +53,7 @@ h1{font-size:18px;margin:0;letter-spacing:-.01em;font-weight:650}
 .chip.awake,.chip.ready,.chip.up,.chip.owner{background:var(--accent-soft);color:var(--accent)}
 .chip.loading{background:var(--amber-soft);color:var(--amber)}
 .chip.down,.chip.error{background:var(--red-soft);color:var(--red)}
+.chip.disabled{background:var(--idle-soft);color:var(--ink-3)}
 .stats{display:flex;gap:22px;flex-wrap:wrap}
 .stat{min-width:64px}
 .stat .k{font-size:11px;color:var(--ink-3)}
@@ -97,10 +98,13 @@ input.dirty{border-color:var(--amber)}
 .seg{display:inline-flex;flex-wrap:wrap;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .seg button{border:0;border-radius:0;padding:6px 14px}
 .seg button.on{background:var(--ink);color:var(--bg)}
+.sec-h{font-size:12px;font-weight:600;color:var(--ink-2);padding:16px 0 2px}
 .etable{width:100%;border-collapse:collapse;font-size:12px}
 .etable th{text-align:left;font-weight:550;color:var(--ink-3);padding:0 4px 6px}
 .etable td{padding:3px 4px}
+.etable th.chk,.etable td.chk{width:42px;text-align:center}
 .etable button{padding:4px 8px}
+.lane.off{opacity:.55}
 .save{display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:12px 18px;border-top:1px solid var(--line)}
 .save .msg{color:var(--ink-3);font-size:12.5px;margin-right:auto}
 /* log */
@@ -208,13 +212,14 @@ function renderStatus(s){
 
     let html = "";
     for(const [name, e] of Object.entries(a.engines)){
-      const isOwner = a.owner === name;
+      const enabled = e.enabled !== false, isOwner = a.owner === name;
       const left = e.state === "awake" && isOwner && !e.inflight ? Math.max(0, a.idle_sleep_sec - e.idle_sec) : null;
-      html += `<div class="lane">
+      const badge = e.boot && enabled ? " · boot" : "";
+      html += `<div class="lane ${enabled?"":"off"}">
         <div><div class="lane-name">${esc(name)} <span class="chip ${e.state}">${e.state}</span></div>
-          <div class="lane-sub">:${e.listen} → ${esc(e.backend)}${e.text_only ? " · text-only" : ""}</div></div>
-        <div class="stats">${stat("in flight", e.inflight)}${stat("requests", n(e.requests||0))}${stat("wakes", n(e.wakes||0))}${stat("last wake", e.last_wake_sec ? e.last_wake_sec+"s" : "—")}${stat("sleeps in", left == null ? "—" : fmtDur(left))}${e.errors ? stat("errors", n(e.errors)) : ""}</div>
-        <div class="acts"><button data-a="warm" data-t="${esc(name)}" ${e.state==="awake"&&isOwner?"disabled":""}>Wake</button><button data-a="sleep" data-t="${esc(name)}" ${e.state!=="awake"||e.inflight?"disabled":""}>Sleep</button></div>
+          <div class="lane-sub">:${e.listen} → ${esc(e.backend)}${e.text_only ? " · text-only" : ""}${badge}</div></div>
+        <div class="stats">${stat("in flight", n(e.inflight||0))}${stat("requests", n(e.requests||0))}${stat("wakes", n(e.wakes||0))}${stat("last wake", e.last_wake_sec ? e.last_wake_sec+"s" : "—")}${stat("sleeps in", left == null ? "—" : fmtDur(left))}${e.errors ? stat("errors", n(e.errors)) : ""}</div>
+        <div class="acts">${enabled?`<button data-a="warm" data-t="${esc(name)}" ${e.state==="awake"&&isOwner?"disabled":""}>Wake</button><button data-a="sleep" data-t="${esc(name)}" ${e.state!=="awake"||e.inflight?"disabled":""}>Sleep</button>`:""}</div>
       </div>`;
     }
     const q = a.comfy_queue || {};
@@ -270,25 +275,35 @@ function setDraft(k, v){
   updateSave();
 }
 function renderFields(){
-  const html = schema.fields.filter(f => f.group === tab).map(f => {
+  let last = null, html = "";
+  for(const f of schema.fields.filter(x => x.group === tab)){
+    if(f.section && f.section !== last){
+      last = f.section;
+      html += `<div class="sec-h">${esc((schema.sections||{})[f.section] || f.section)}</div>`;
+    }
     const v = val(f.key), dirty = f.key in draft ? "dirty" : "";
     let input;
     if(f.type === "bool") input = `<label class="switch"><input type="checkbox" data-k="${f.key}" ${v?"checked":""}><span></span></label>`;
     else if(f.type === "choice") input = `<div class="seg">${f.choices.map(c=>`<button data-k="${f.key}" data-v="${c}" class="${c==v?"on":""}">${c}</button>`).join("")}</div>`;
     else if(f.type === "engines") input = enginesTable(f.key, v);
     else input = `<input class="${dirty}" type="${f.type==="str"?"text":"number"}" ${f.type==="float"?'step="any"':""} ${f.min!=null?`min="${f.min}"`:""} ${f.max!=null?`max="${f.max}"`:""} data-k="${f.key}" value="${esc(v)}">`;
-    return `<div class="f"><div><label>${esc(f.label)} <span class="tag ${f.live?"live":""}">${f.live?"live":"restart"}</span></label>${f.help?`<div class="help">${esc(f.help)}</div>`:""}</div><div>${input}</div></div>`;
-  }).join("");
+    html += `<div class="f"><div><label>${esc(f.label)} <span class="tag ${f.live?"live":""}">${f.live?"live":"restart"}</span></label>${f.help?`<div class="help">${esc(f.help)}</div>`:""}</div><div>${input}</div></div>`;
+  }
   $("#fields").innerHTML = html;
 }
 function enginesTable(key, list){
-  const rows = list.map((e,i) => `<tr>
+  const rows = list.map((e,i) => {
+    const on = e.enabled !== false, boot = !!e.boot;
+    return `<tr>
     <td><input type="text" data-ek="${key}" data-i="${i}" data-f="name" value="${esc(e.name)}"></td>
     <td><input type="text" data-ek="${key}" data-i="${i}" data-f="backend" value="${esc(e.backend)}"></td>
     <td><input type="number" data-ek="${key}" data-i="${i}" data-f="listen" value="${e.listen}"></td>
     <td><input type="number" data-ek="${key}" data-i="${i}" data-f="free_mb" value="${e.free_mb}"></td>
-    <td><button data-erm="${i}" title="Remove">✕</button></td></tr>`).join("");
-  return `<table class="etable"><tr><th>Name</th><th>Backend</th><th>Listen</th><th>Free MiB to wake</th><th></th></tr>${rows}</table>
+    <td class="chk"><input type="checkbox" data-ek="${key}" data-i="${i}" data-f="enabled" ${on?"checked":""} title="Available"></td>
+    <td class="chk"><input type="checkbox" data-ek="${key}" data-i="${i}" data-f="boot" ${boot?"checked":""} ${on?"":"disabled"} title="Load on boot"></td>
+    <td><button data-erm="${i}" title="Remove">✕</button></td></tr>`;
+  }).join("");
+  return `<table class="etable"><tr><th>Name</th><th>Backend</th><th>Listen</th><th>Free MiB</th><th class="chk">On</th><th class="chk">Boot</th><th></th></tr>${rows}</table>
     <div style="margin-top:8px"><button data-eadd="${key}">Add engine</button></div>`;
 }
 $("#fields").addEventListener("input", e => {
@@ -301,8 +316,16 @@ $("#fields").addEventListener("input", e => {
     setDraft(f.key, v); t.classList.toggle("dirty", f.key in draft);
   } else if(t.dataset.ek){
     const list = JSON.parse(JSON.stringify(val(t.dataset.ek)));
-    const fld = t.dataset.f; list[+t.dataset.i][fld] = (fld === "listen" || fld === "free_mb") ? parseInt(t.value||"0",10) : t.value;
-    setDraft(t.dataset.ek, list); t.classList.add("dirty");
+    const i = +t.dataset.i, fld = t.dataset.f;
+    if(t.type === "checkbox"){
+      list[i][fld] = t.checked;
+      if(fld === "boot" && t.checked) list.forEach((e,j) => { if(j!==i) e.boot = false; });
+      if(fld === "enabled" && !t.checked) list[i].boot = false;
+      setDraft(t.dataset.ek, list); renderFields();
+    } else {
+      list[i][fld] = (fld === "listen" || fld === "free_mb") ? parseInt(t.value||"0",10) : t.value;
+      setDraft(t.dataset.ek, list); t.classList.add("dirty");
+    }
   }
 });
 $("#fields").addEventListener("click", e => {
@@ -313,7 +336,7 @@ $("#fields").addEventListener("click", e => {
     const v = f && typeof f.choices?.[0] === "string" ? raw : +raw;
     setDraft(b.dataset.k, v); renderFields();
   }
-  else if(b.dataset.eadd){ const k=b.dataset.eadd, list=JSON.parse(JSON.stringify(val(k))); list.push({name:"engine"+(list.length+1),backend:"127.0.0.1:8004",listen:8006,free_mb:16000}); setDraft(k,list); renderFields(); }
+  else if(b.dataset.eadd){ const k=b.dataset.eadd, list=JSON.parse(JSON.stringify(val(k))); list.push({name:"engine"+(list.length+1),backend:"127.0.0.1:8004",listen:8006,free_mb:16000,enabled:true,boot:false}); setDraft(k,list); renderFields(); }
   else if(b.dataset.erm != null){ const list=JSON.parse(JSON.stringify(val("engines"))); list.splice(+b.dataset.erm,1); setDraft("engines",list); renderFields(); }
 });
 function updateSave(){

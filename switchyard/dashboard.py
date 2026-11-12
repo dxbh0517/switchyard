@@ -96,5 +96,5 @@ class Dashboard:
     def start(self) -> None:
         host, port = self.s.get("dashboard_host"), self.s.get("dashboard_port")
         log("dashboard", f"http://{host}:{port}/")
-        srv = Server((host, port), self.make_handler())
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.server = Server((host, port), self.make_handler())
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
