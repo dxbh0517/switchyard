@@ -14,7 +14,7 @@ import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
-from switchyard import config
+from switchyard import analytics, config
 from switchyard.arbiter import Arbiter, strip_images
 from switchyard.httputil import Server
 from switchyard.ovms_shim import OvmsShim, StreamThinkFilter, split_think
@@ -207,6 +207,7 @@ class ArbiterTests(unittest.TestCase):
         time.sleep(0.3)
 
     def tearDown(self):
+        analytics.reset()
         for srv in [s for s, _ in self.srv] + self.arb.servers:
             srv.shutdown()
             srv.server_close()
@@ -238,6 +239,14 @@ class ArbiterTests(unittest.TestCase):
     def test_text_only_strips_images(self):
         self.chat(self.la, [{"type": "image_url", "image_url": {"url": "data:x"}}])
         self.assertEqual(self.a_state["last_body"]["messages"][0]["content"][0]["type"], "text")
+
+    def test_wake_records_analytics(self):
+        analytics.configure(self.arb.s, path=os.path.join(self.tmp.name, "analytics.sqlite"))
+        self.chat(self.la)
+        analytics.get().flush()
+        kinds = [e["kind"] for e in analytics.history()["events"]]
+        self.assertIn("wake", kinds)
+        self.assertIn("unload", kinds)
 
 
 class OvmsShimTests(unittest.TestCase):

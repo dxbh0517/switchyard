@@ -5,6 +5,7 @@ GET  /api/settings              schema + current values
 POST /api/settings              {"key": value, ...}
 POST /api/action                {"component": "arbiter|stt", "action": "...", "target": "..."}
 GET  /api/logs?since=ID         activity log
+GET  /api/history?limit=&since=&kind=&engine=   analytics events + summary
 POST /api/restart               exit; the container's restart policy starts it again
 """
 from __future__ import annotations
@@ -16,7 +17,7 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__, events
+from . import __version__, analytics, events
 from .config import Settings
 from .events import log
 from .httputil import Handler, Server
@@ -28,6 +29,7 @@ class Dashboard:
     def __init__(self, settings: Settings, components: dict):
         self.s = settings
         self.c = components   # name -> component (or None when disabled)
+        analytics.configure_if_needed(settings)
 
     def status(self) -> dict:
         out = {"version": __version__, "uptime": round(time.time() - events.STARTED),
@@ -63,6 +65,19 @@ class Dashboard:
                 elif u.path == "/api/logs":
                     since = int((parse_qs(u.query).get("since") or ["0"])[0])
                     self.send_json(200, events.since(since))
+                elif u.path == "/api/history":
+                    qs = parse_qs(u.query)
+                    def q(name, default=None):
+                        return (qs.get(name) or [default])[0]
+                    try:
+                        limit = int(q("limit", "100"))
+                        payload = analytics.get().history(
+                            limit=limit, since=q("since") or None,
+                            kind=q("kind") or None, engine=q("engine") or None)
+                    except (ValueError, TypeError) as e:
+                        self.send_json(400, {"error": str(e)})
+                        return
+                    self.send_json(200, payload)
                 else:
                     self.send_json(404, {"error": "not found"})
 
