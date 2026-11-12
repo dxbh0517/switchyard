@@ -94,7 +94,7 @@ input.dirty{border-color:var(--amber)}
 .switch span:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:transform .2s cubic-bezier(.2,.8,.2,1);box-shadow:0 1px 2px rgba(0,0,0,.2)}
 .switch input:checked+span{background:var(--accent)}
 .switch input:checked+span:before{transform:translateX(16px)}
-.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg{display:inline-flex;flex-wrap:wrap;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .seg button{border:0;border-radius:0;padding:6px 14px}
 .seg button.on{background:var(--ink);color:var(--bg)}
 .etable{width:100%;border-collapse:collapse;font-size:12px}
@@ -193,14 +193,18 @@ function renderStatus(s){
   if(!a){ $("#gowner").textContent = "GPU arbiter is disabled"; $("#lanes").innerHTML = ""; }
   else{
     const g = a.gpu || {};
-    $("#gname").textContent = g.name || "GPU";
+    $("#gname").textContent = g.name || (g.index != null ? `GPU ${g.index}` : "GPU");
     const owner = a.owner === "comfy" ? "ComfyUI" : a.owner;
     $("#gowner").innerHTML = owner ? `Held by <b>${esc(owner)}</b>` : "Idle — every engine asleep";
     if(g.total_mb){
-      const used = g.total_mb - g.free_mb;
-      $("#gvram").textContent = `${(used/1024).toFixed(1)} / ${(g.total_mb/1024).toFixed(1)} GiB`;
+      const used = g.used_mb != null ? g.used_mb : (g.total_mb - g.free_mb);
+      const src = g.source && g.source !== "unknown" ? ` · ${g.source}` : "";
+      $("#gvram").textContent = `${(used/1024).toFixed(1)} / ${(g.total_mb/1024).toFixed(1)} GiB${src}`;
       $("#gbar").style.width = (100*used/g.total_mb).toFixed(1) + "%";
-    } else { $("#gvram").textContent = "VRAM unknown (ComfyUI down?)"; $("#gbar").style.width = "0"; }
+    } else {
+      $("#gvram").textContent = g.source === "off" ? "VRAM probe off" : "VRAM unknown";
+      $("#gbar").style.width = "0";
+    }
 
     let html = "";
     for(const [name, e] of Object.entries(a.engines)){
@@ -303,7 +307,12 @@ $("#fields").addEventListener("input", e => {
 });
 $("#fields").addEventListener("click", e => {
   const b = e.target.closest("button"); if(!b) return;
-  if(b.dataset.k){ setDraft(b.dataset.k, +b.dataset.v); renderFields(); }
+  if(b.dataset.k){
+    const f = schema.fields.find(x => x.key === b.dataset.k);
+    const raw = b.dataset.v;
+    const v = f && typeof f.choices?.[0] === "string" ? raw : +raw;
+    setDraft(b.dataset.k, v); renderFields();
+  }
   else if(b.dataset.eadd){ const k=b.dataset.eadd, list=JSON.parse(JSON.stringify(val(k))); list.push({name:"engine"+(list.length+1),backend:"127.0.0.1:8004",listen:8006,free_mb:16000}); setDraft(k,list); renderFields(); }
   else if(b.dataset.erm != null){ const list=JSON.parse(JSON.stringify(val("engines"))); list.splice(+b.dataset.erm,1); setDraft("engines",list); renderFields(); }
 });
