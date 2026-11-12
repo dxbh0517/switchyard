@@ -2,6 +2,7 @@
 
 GET  /api/status                live state of every component
 GET  /api/settings              schema + current values
+GET  /api/plugins               discovered engine adapters (read-only; not used for occupancy yet)
 POST /api/settings              {"key": value, ...}
 POST /api/action                {"component": "arbiter|stt", "action": "...", "target": "..."}
 GET  /api/logs?since=ID         activity log
@@ -20,6 +21,7 @@ from . import __version__, events
 from .config import Settings
 from .events import log
 from .httputil import Handler, Server
+from .plugins import discover
 
 INDEX = (Path(__file__).parent / "static" / "index.html").read_bytes()
 
@@ -63,6 +65,8 @@ class Dashboard:
                 elif u.path == "/api/logs":
                     since = int((parse_qs(u.query).get("since") or ["0"])[0])
                     self.send_json(200, events.since(since))
+                elif u.path == "/api/plugins":
+                    self.send_json(200, discover().as_dict())
                 else:
                     self.send_json(404, {"error": "not found"})
 
