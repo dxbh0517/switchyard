@@ -19,6 +19,9 @@ from http.server import BaseHTTPRequestHandler
 
 from switchyard import __version__, config
 from switchyard.arbiter import Arbiter, strip_images
+from switchyard.backends import BACKENDS, ComfyBackend, VllmBackend
+from switchyard.budget import lru_victims, resolve_cost, usable_mb
+from switchyard.estimate import estimate_from_engine, estimate_vram_mb, gpu_layers_that_fit, quant_bytes
 from switchyard.httputil import Server
 from switchyard.ovms_shim import OvmsShim, StreamThinkFilter, split_think
 from switchyard.stt import Stt, parse_multipart
@@ -49,9 +52,36 @@ def get(url):
         return json.loads(r.read())
 
 
+def wait_until(pred, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return bool(pred())
+
+
+def this_thread_holds(cond) -> bool:
+    """True if the calling thread owns the arbiter condition (RLock has no public locked())."""
+    return cond._lock._is_owned()
+
+
+def wrap_occupancy_http(arb, held: list):
+    """Record whether the caller still holds the arbiter lock when wake/sleep/is_sleeping run."""
+    def wrap(fn):
+        def inner(*a, **k):
+            held.append(this_thread_holds(arb.cond))
+            return fn(*a, **k)
+        return inner
+    for b in arb.ctl.values():
+        b.wake = wrap(b.wake)
+        b.sleep = wrap(b.sleep)
+        b.is_sleeping = wrap(b.is_sleeping)
+
+
 def fake_engine():
     """A vLLM-like backend with sleep mode."""
-    st = {"sleeping": True, "calls": []}
+    st = {"sleeping": True, "calls": [], "serving": 0, "hold": None, "is_sleeping_gets": 0}
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -69,6 +99,7 @@ def fake_engine():
 
         def do_GET(self):
             if self.path == "/is_sleeping":
+                st["is_sleeping_gets"] += 1
                 self._send({"is_sleeping": st["sleeping"]})
             else:
                 self._send({"data": []})
@@ -82,7 +113,14 @@ def fake_engine():
                 st["sleeping"] = False
             if self.path.startswith("/v1/chat/completions"):
                 st["last_body"] = json.loads(body)
-                self._send({"id": "x", "awake_when_served": not st["sleeping"]})
+                st["serving"] += 1
+                try:
+                    hold = st["hold"]
+                    if hold is not None:
+                        hold.wait(timeout=10)
+                    self._send({"id": "x", "awake_when_served": not st["sleeping"]})
+                finally:
+                    st["serving"] -= 1
             else:
                 self._send({})
 
@@ -124,6 +162,16 @@ class ConfigTests(unittest.TestCase):
     def test_parse_engines(self):
         e = config.parse_engines("qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500")
         self.assertEqual(e[1], {"name": "vision", "backend": "127.0.0.1:8003", "listen": 8005, "free_mb": 17500})
+        with_cost = config.parse_engines("qwen=127.0.0.1:8002@8000:21400:18000")
+        self.assertEqual(with_cost[0]["vram_mb"], 18000)
+        self.assertEqual(with_cost[0]["free_mb"], 21400)
+
+    def test_shared_vram_defaults_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = config.Settings(os.path.join(d, "s.json"))
+            self.assertFalse(s.get("shared_vram"))
+            self.assertEqual(s.get("vram_budget_mb"), 0)
+            self.assertEqual(s.get("vram_safety_mb"), 1024)
 
     def test_env_file_precedence_and_restart_flag(self):
         with tempfile.TemporaryDirectory() as d:
@@ -257,6 +305,278 @@ class ArbiterTests(unittest.TestCase):
     def test_text_only_strips_images(self):
         self.chat(self.la, [{"type": "image_url", "image_url": {"url": "data:x"}}])
         self.assertEqual(self.a_state["last_body"]["messages"][0]["content"][0]["type"], "text")
+
+    def test_status_reports_exclusive_placement(self):
+        st = get(f"http://127.0.0.1:{self.la}/gpu/status")
+        self.assertEqual(st["placement"], "exclusive")
+        self.assertIn("budget", st)
+        self.assertIn("vram_source", st["engines"]["a"])
+
+    def test_exclusive_serializes_other_engine(self):
+        gate = threading.Event()
+        self.a_state["hold"] = gate
+        ta = threading.Thread(target=lambda: self.chat(self.la))
+        ta.start()
+        self.assertTrue(wait_until(lambda: self.a_state["serving"]))
+        tb_done = []
+        tb = threading.Thread(target=lambda: tb_done.append(self.chat(self.lb)))
+        tb.start()
+        time.sleep(0.3)
+        self.assertFalse(self.b_state["serving"], "b must wait while a is in flight")
+        self.assertFalse(tb_done)
+        gate.set()
+        ta.join(5)
+        tb.join(5)
+        self.assertTrue(tb_done)
+        self.assertTrue(self.a_state["sleeping"])
+        self.assertFalse(self.b_state["sleeping"])
+
+    def test_occupancy_http_drops_the_lock(self):
+        held = []
+        wrap_occupancy_http(self.arb, held)
+        self.chat(self.la)
+        self.chat(self.lb)
+        self.assertTrue(held, "wake/sleep should have run")
+        self.assertFalse(any(held), "occupancy HTTP must not run under the arbiter lock")
+
+
+class BackendTests(unittest.TestCase):
+    def test_vllm_health_wake_sleep(self):
+        st, handler = fake_engine()
+        srv, port = serve(handler)
+        try:
+            b = VllmBackend("127.0.0.1", port)
+            self.assertTrue(b.health())
+            self.assertTrue(b.is_sleeping())
+            self.assertIsNone(b.estimate_vram())
+            b.wake(2)
+            self.assertFalse(b.is_sleeping())
+            self.assertIn("/wake_up?tags=weights", st["calls"])
+            self.assertIn("/collective_rpc", st["calls"])
+            self.assertTrue(any(c.startswith("/wake_up?tags=kv_cache") for c in st["calls"]))
+            b.sleep(2)
+            self.assertTrue(b.is_sleeping())
+            self.assertTrue(any(c.startswith("/sleep?level=") for c in st["calls"]))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_vllm_level1_wake_skips_reload(self):
+        st, handler = fake_engine()
+        srv, port = serve(handler)
+        try:
+            VllmBackend("127.0.0.1", port).wake(1)
+            self.assertEqual(st["calls"], ["/wake_up"])
+            self.assertFalse(st["sleeping"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_comfy_health_vram_unload(self):
+        st, handler = fake_comfy()
+        srv, port = serve(handler)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                s = config.Settings(os.path.join(d, "s.json"))
+                s.update({"comfy_url": f"http://127.0.0.1:{port}", "comfy_free_wait_sec": 1})
+                b = ComfyBackend(s)
+                self.assertTrue(b.health())
+                free, snap = b.vram()
+                self.assertGreater(free, 0)
+                self.assertEqual(snap["total_mb"], 32768)
+                self.assertIn("Fake GPU", snap["name"])
+                self.assertEqual(b.estimate_vram(), snap["total_mb"] - snap["free_mb"])
+                b.sleep()
+                self.assertGreaterEqual(st["freed"], 1)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_backends_registry_is_the_extension_point(self):
+        self.assertEqual(set(BACKENDS), {"vllm", "comfy"})
+        self.assertIs(BACKENDS["vllm"], VllmBackend)
+        self.assertIs(BACKENDS["comfy"], ComfyBackend)
+
+
+class EstimateTests(unittest.TestCase):
+    def test_fp16_heavier_than_q4_and_context_grows_kv(self):
+        fp16 = estimate_vram_mb(7_000_000_000, quant="fp16", context_length=4096)
+        q4 = estimate_vram_mb(7_000_000_000, quant="q4_k", context_length=4096)
+        q4_long = estimate_vram_mb(7_000_000_000, quant="q4_k", context_length=16384)
+        self.assertGreater(fp16, 12_000)
+        self.assertLess(fp16, 18_000)
+        self.assertGreater(fp16, q4 * 2)
+        self.assertLess(q4, 8_000)
+        self.assertGreater(q4_long, q4)
+
+    def test_quant_aliases(self):
+        self.assertEqual(quant_bytes("float16"), quant_bytes("fp16"))
+        self.assertEqual(quant_bytes("q4_k_m"), quant_bytes("q4_k"))
+        self.assertEqual(quant_bytes("awq"), quant_bytes("int4"))
+        with self.assertRaises(ValueError):
+            quant_bytes("nope")
+
+    def test_gpu_layers_that_fit(self):
+        full = gpu_layers_that_fit(24_000, 7_000_000_000, quant="fp16", context_length=4096)
+        partial = gpu_layers_that_fit(8_192, 7_000_000_000, quant="fp16", context_length=4096)
+        quant = gpu_layers_that_fit(8_192, 7_000_000_000, quant="q4_k", context_length=4096)
+        self.assertEqual(full, 32)
+        self.assertGreater(partial, 0)
+        self.assertLess(partial, full)
+        self.assertEqual(quant, 32)
+
+    def test_estimate_from_engine_needs_params(self):
+        self.assertIsNone(estimate_from_engine({"free_mb": 1000}))
+        mb = estimate_from_engine({"n_params": 7_000_000_000, "quant": "q4_k", "context_length": 4096})
+        self.assertEqual(mb, estimate_vram_mb(7_000_000_000, quant="q4_k", context_length=4096))
+
+
+class BudgetTests(unittest.TestCase):
+    def test_usable_and_resolve_cost(self):
+        self.assertEqual(usable_mb(8192, 1024), 7168)
+        self.assertIsNone(usable_mb(0, 1024))
+        self.assertEqual(resolve_cost(100, 200, 300, 400), (100, "measured"))
+        self.assertEqual(resolve_cost(None, 200, 300, 400), (200, "configured"))
+        self.assertEqual(resolve_cost(None, None, 300, 400), (300, "estimate"))
+        self.assertEqual(resolve_cost(None, None, None, 400), (400, "free_mb"))
+        self.assertEqual(resolve_cost(0, 0, 0, 0), (0, "free_mb"))
+
+    def test_lru_evicts_oldest_until_it_fits(self):
+        resident = {"a": 1.0, "b": 2.0}
+        costs = {"a": 4000, "b": 4000}
+        self.assertEqual(lru_victims(resident, costs, "c", 4000, 12_000), [])
+        self.assertEqual(lru_victims(resident, costs, "c", 4000, 9000), ["a"])
+        self.assertEqual(lru_victims(resident, costs, "c", 4000, 7000), ["a", "b"])
+        self.assertEqual(lru_victims(resident, costs, "c", 8000, 7000), ["a", "b"])
+
+
+class ArbiterSharedTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.a_state, ha = fake_engine()
+        self.b_state, hb = fake_engine()
+        self.c_state, hc = fake_comfy()
+        self.srv = [serve(ha), serve(hb), serve(hc)]
+        (_, pa), (_, pb), (_, pc) = self.srv
+        self.la, self.lb = free_port(), free_port()
+        s = config.Settings(os.path.join(self.tmp.name, "s.json"))
+        s.update({"engines": f"a=127.0.0.1:{pa}@{self.la}:1000:2000,b=127.0.0.1:{pb}@{self.lb}:1000:2000",
+                  "text_only_engines": "a", "comfy_url": f"http://127.0.0.1:{pc}", "listen_host": "127.0.0.1",
+                  "shared_vram": True, "vram_budget_mb": 8000, "vram_safety_mb": 1000, "idle_sleep_sec": 3600})
+        self.arb = Arbiter(s)
+        self.arb.start()
+        time.sleep(0.3)
+
+    def tearDown(self):
+        for srv in [s for s, _ in self.srv] + self.arb.servers:
+            srv.shutdown()
+            srv.server_close()
+        self.tmp.cleanup()
+
+    def chat(self, port, content="hi"):
+        return post(f"http://127.0.0.1:{port}/v1/chat/completions",
+                    {"messages": [{"role": "user", "content": content}]})
+
+    def test_keeps_both_resident_when_they_fit(self):
+        self.chat(self.la)
+        self.chat(self.lb)
+        self.assertFalse(self.a_state["sleeping"])
+        self.assertFalse(self.b_state["sleeping"])
+        st = get(f"http://127.0.0.1:{self.la}/gpu/status")
+        self.assertEqual(st["placement"], "shared")
+        self.assertEqual(st["owner"], "b")
+        self.assertCountEqual(st["resident"], ["a", "b"])
+
+    def test_lru_evicts_when_the_budget_is_tight(self):
+        self.arb.s.update({"engines": [
+            {**self.arb.s.engine("a"), "vram_mb": 4000},
+            {**self.arb.s.engine("b"), "vram_mb": 4000},
+        ]})
+        self.chat(self.la)
+        self.chat(self.lb)
+        self.assertTrue(self.a_state["sleeping"], "a is LRU and must move for b")
+        self.assertFalse(self.b_state["sleeping"])
+        self.chat(self.la)
+        self.assertFalse(self.a_state["sleeping"])
+        self.assertTrue(self.b_state["sleeping"], "b is LRU and must move for a")
+
+    def test_comfy_still_sleeps_every_engine(self):
+        self.chat(self.la)
+        self.chat(self.lb)
+        post(f"http://127.0.0.1:{self.la}/gpu/acquire")
+        self.assertTrue(self.a_state["sleeping"])
+        self.assertTrue(self.b_state["sleeping"])
+        self.assertEqual(self.arb.state["owner"], "comfy")
+        post(f"http://127.0.0.1:{self.la}/gpu/release")
+
+    def test_cost_falls_back_to_estimate(self):
+        self.arb.s.update({"engines": [
+            {**self.arb.s.engine("a"), "vram_mb": 0, "n_params": 7_000_000_000, "quant": "q4_k",
+             "context_length": 4096, "free_mb": 1000},
+            self.arb.s.engine("b"),
+        ]})
+        cost, src = self.arb.cost_of("a")
+        self.assertEqual(src, "estimate")
+        self.assertEqual(cost, estimate_vram_mb(7_000_000_000, quant="q4_k", context_length=4096))
+
+    def test_resident_engines_serve_in_parallel(self):
+        self.chat(self.la)
+        self.chat(self.lb)
+        gate = threading.Event()
+        self.a_state["hold"] = self.b_state["hold"] = gate
+        ra, rb = {}, {}
+        ta = threading.Thread(target=lambda: ra.update(self.chat(self.la)))
+        tb = threading.Thread(target=lambda: rb.update(self.chat(self.lb)))
+        ta.start()
+        tb.start()
+        self.assertTrue(wait_until(lambda: self.a_state["serving"] and self.b_state["serving"]),
+                        "both resident engines should be serving at once")
+        gate.set()
+        ta.join(5)
+        tb.join(5)
+        self.assertTrue(ra.get("awake_when_served"))
+        self.assertTrue(rb.get("awake_when_served"))
+
+    def test_eviction_waits_for_victim_inflight(self):
+        self.arb.s.update({"engines": [
+            {**self.arb.s.engine("a"), "vram_mb": 4000},
+            {**self.arb.s.engine("b"), "vram_mb": 4000},
+        ]})
+        self.chat(self.la)
+        gate = threading.Event()
+        self.a_state["hold"] = gate
+        ta = threading.Thread(target=lambda: self.chat(self.la))
+        ta.start()
+        self.assertTrue(wait_until(lambda: self.a_state["serving"]))
+        tb_done = []
+        tb = threading.Thread(target=lambda: tb_done.append(self.chat(self.lb)))
+        tb.start()
+        time.sleep(0.3)
+        self.assertTrue(self.a_state["serving"])
+        self.assertFalse(self.a_state["sleeping"], "cannot evict a while it still has a request")
+        self.assertFalse(tb_done)
+        self.assertFalse(self.b_state["serving"])
+        gate.set()
+        ta.join(5)
+        tb.join(5)
+        self.assertTrue(tb_done)
+        self.assertTrue(self.a_state["sleeping"])
+        self.assertFalse(self.b_state["sleeping"])
+
+    def test_fast_path_does_not_probe_is_sleeping(self):
+        self.chat(self.la)
+        n = self.a_state["is_sleeping_gets"]
+        self.chat(self.la)
+        self.assertEqual(self.a_state["is_sleeping_gets"], n,
+                         "already-resident enter must use cached sleep state, not HTTP")
+
+    def test_occupancy_http_drops_the_lock(self):
+        held = []
+        wrap_occupancy_http(self.arb, held)
+        self.chat(self.la)
+        self.chat(self.lb)
+        self.assertTrue(held, "wake/sleep should have run")
+        self.assertFalse(any(held), "occupancy HTTP must not run under the arbiter lock")
 
 
 class OvmsShimTests(unittest.TestCase):

@@ -195,7 +195,10 @@ function renderStatus(s){
     const g = a.gpu || {};
     $("#gname").textContent = g.name || "GPU";
     const owner = a.owner === "comfy" ? "ComfyUI" : a.owner;
-    $("#gowner").innerHTML = owner ? `Held by <b>${esc(owner)}</b>` : "Idle — every engine asleep";
+    const others = (a.resident || []).filter(n => n !== a.owner);
+    let held = owner ? `Held by <b>${esc(owner)}</b>` : "Idle — every engine asleep";
+    if(a.placement === "shared" && others.length) held += ` · also ${others.map(esc).join(", ")}`;
+    $("#gowner").innerHTML = held;
     if(g.total_mb){
       const used = g.total_mb - g.free_mb;
       $("#gvram").textContent = `${(used/1024).toFixed(1)} / ${(g.total_mb/1024).toFixed(1)} GiB`;
@@ -205,12 +208,12 @@ function renderStatus(s){
     let html = "";
     for(const [name, e] of Object.entries(a.engines)){
       const isOwner = a.owner === name;
-      const left = e.state === "awake" && isOwner && !e.inflight ? Math.max(0, a.idle_sleep_sec - e.idle_sec) : null;
+      const left = e.state === "awake" && !e.inflight ? Math.max(0, a.idle_sleep_sec - e.idle_sec) : null;
       html += `<div class="lane">
-        <div><div class="lane-name">${esc(name)} <span class="chip ${e.state}">${e.state}</span></div>
-          <div class="lane-sub">:${e.listen} → ${esc(e.backend)}${e.text_only ? " · text-only" : ""}</div></div>
+        <div><div class="lane-name">${esc(name)} <span class="chip ${e.state}${isOwner?" owner":""}">${e.state}</span></div>
+          <div class="lane-sub">:${e.listen} → ${esc(e.backend)}${e.text_only ? " · text-only" : ""}${e.vram_mb ? " · "+e.vram_mb+" MiB" : ""}</div></div>
         <div class="stats">${stat("in flight", e.inflight)}${stat("requests", n(e.requests||0))}${stat("wakes", n(e.wakes||0))}${stat("last wake", e.last_wake_sec ? e.last_wake_sec+"s" : "—")}${stat("sleeps in", left == null ? "—" : fmtDur(left))}${e.errors ? stat("errors", n(e.errors)) : ""}</div>
-        <div class="acts"><button data-a="warm" data-t="${esc(name)}" ${e.state==="awake"&&isOwner?"disabled":""}>Wake</button><button data-a="sleep" data-t="${esc(name)}" ${e.state!=="awake"||e.inflight?"disabled":""}>Sleep</button></div>
+        <div class="acts"><button data-a="warm" data-t="${esc(name)}" ${e.state==="awake"?"disabled":""}>Wake</button><button data-a="sleep" data-t="${esc(name)}" ${e.state!=="awake"||e.inflight?"disabled":""}>Sleep</button></div>
       </div>`;
     }
     const q = a.comfy_queue || {};
@@ -283,8 +286,9 @@ function enginesTable(key, list){
     <td><input type="text" data-ek="${key}" data-i="${i}" data-f="backend" value="${esc(e.backend)}"></td>
     <td><input type="number" data-ek="${key}" data-i="${i}" data-f="listen" value="${e.listen}"></td>
     <td><input type="number" data-ek="${key}" data-i="${i}" data-f="free_mb" value="${e.free_mb}"></td>
+    <td><input type="number" data-ek="${key}" data-i="${i}" data-f="vram_mb" value="${e.vram_mb||""}" placeholder="optional"></td>
     <td><button data-erm="${i}" title="Remove">✕</button></td></tr>`).join("");
-  return `<table class="etable"><tr><th>Name</th><th>Backend</th><th>Listen</th><th>Free MiB to wake</th><th></th></tr>${rows}</table>
+  return `<table class="etable"><tr><th>Name</th><th>Backend</th><th>Listen</th><th>Free MiB to wake</th><th>VRAM cost MiB</th><th></th></tr>${rows}</table>
     <div style="margin-top:8px"><button data-eadd="${key}">Add engine</button></div>`;
 }
 $("#fields").addEventListener("input", e => {
@@ -297,7 +301,9 @@ $("#fields").addEventListener("input", e => {
     setDraft(f.key, v); t.classList.toggle("dirty", f.key in draft);
   } else if(t.dataset.ek){
     const list = JSON.parse(JSON.stringify(val(t.dataset.ek)));
-    const fld = t.dataset.f; list[+t.dataset.i][fld] = (fld === "listen" || fld === "free_mb") ? parseInt(t.value||"0",10) : t.value;
+    const fld = t.dataset.f;
+    if(fld === "vram_mb" && t.value === "") delete list[+t.dataset.i].vram_mb;
+    else list[+t.dataset.i][fld] = (fld === "listen" || fld === "free_mb" || fld === "vram_mb") ? parseInt(t.value||"0",10) : t.value;
     setDraft(t.dataset.ek, list); t.classList.add("dirty");
   }
 });
