@@ -50,9 +50,9 @@ h1{font-size:18px;margin:0;letter-spacing:-.01em;font-weight:650}
 .lane-name{font-weight:600;display:flex;align-items:center;gap:8px}
 .lane-sub{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);margin-top:2px}
 .chip{font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:99px;background:var(--idle-soft);color:var(--ink-2);text-transform:capitalize}
-.chip.awake,.chip.ready,.chip.up,.chip.owner{background:var(--accent-soft);color:var(--accent)}
+.chip.awake,.chip.ready,.chip.up,.chip.owner,.chip.healthy{background:var(--accent-soft);color:var(--accent)}
 .chip.loading{background:var(--amber-soft);color:var(--amber)}
-.chip.down,.chip.error{background:var(--red-soft);color:var(--red)}
+.chip.down,.chip.error,.chip.unhealthy,.chip.unreachable{background:var(--red-soft);color:var(--red)}
 .stats{display:flex;gap:22px;flex-wrap:wrap}
 .stat{min-width:64px}
 .stat .k{font-size:11px;color:var(--ink-3)}
@@ -206,17 +206,21 @@ function renderStatus(s){
     for(const [name, e] of Object.entries(a.engines)){
       const isOwner = a.owner === name;
       const left = e.state === "awake" && isOwner && !e.inflight ? Math.max(0, a.idle_sleep_sec - e.idle_sec) : null;
+      const h = e.health || {};
+      const hchip = h.status && h.status !== "unknown" ? ` <span class="chip ${esc(h.status)}">${esc(h.status)}</span>` : "";
       html += `<div class="lane">
-        <div><div class="lane-name">${esc(name)} <span class="chip ${e.state}">${e.state}</span></div>
-          <div class="lane-sub">:${e.listen} → ${esc(e.backend)}${e.text_only ? " · text-only" : ""}</div></div>
+        <div><div class="lane-name">${esc(name)} <span class="chip ${e.state}">${e.state}</span>${hchip}</div>
+          <div class="lane-sub">:${e.listen} → ${esc(e.backend)}${e.text_only ? " · text-only" : ""}${h.last_error ? ` · ${esc(h.last_error)}` : ""}</div></div>
         <div class="stats">${stat("in flight", e.inflight)}${stat("requests", n(e.requests||0))}${stat("wakes", n(e.wakes||0))}${stat("last wake", e.last_wake_sec ? e.last_wake_sec+"s" : "—")}${stat("sleeps in", left == null ? "—" : fmtDur(left))}${e.errors ? stat("errors", n(e.errors)) : ""}</div>
         <div class="acts"><button data-a="warm" data-t="${esc(name)}" ${e.state==="awake"&&isOwner?"disabled":""}>Wake</button><button data-a="sleep" data-t="${esc(name)}" ${e.state!=="awake"||e.inflight?"disabled":""}>Sleep</button></div>
       </div>`;
     }
     const q = a.comfy_queue || {};
+    const ch = a.comfy_health || {};
     const cstate = q.running == null ? "down" : a.owner === "comfy" ? "owner" : "idle";
+    const cchip = ch.status && ch.status !== "unknown" ? ` <span class="chip ${esc(ch.status)}">${esc(ch.status)}</span>` : "";
     html += `<div class="lane">
-      <div><div class="lane-name">ComfyUI <span class="chip ${cstate}">${cstate === "owner" ? "holds GPU" : cstate}</span></div><div class="lane-sub">image &amp; video jobs</div></div>
+      <div><div class="lane-name">ComfyUI <span class="chip ${cstate}">${cstate === "owner" ? "holds GPU" : cstate}</span>${cchip}</div><div class="lane-sub">image &amp; video jobs${ch.last_error ? ` · ${esc(ch.last_error)}` : ""}</div></div>
       <div class="stats">${stat("running", n(q.running))}${stat("queued", n(q.pending))}${stat("claims", a.comfy_active)}</div>
       <div class="acts"><button data-a="comfy_unload" ${a.comfy_active?"disabled":""} title="Drop ComfyUI's models from VRAM">Unload</button><button data-a="comfy_release" ${a.comfy_active?"":"disabled"} title="Clear a stuck claim">Release</button></div>
     </div>`;
