@@ -150,7 +150,38 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | `STT_PORT` | `POST /v1/audio/transcriptions`, `GET /v1/models`, `/health` | speech to text |
 | `DASHBOARD_PORT` | `/`, `/api/status`, `/api/settings`, `/api/action`, `/api/logs`, `/api/restart` | dashboard |
 
-The dashboard API only accepts `POST` requests from its own origin.
+The dashboard API only accepts `POST` requests from its own origin. `switchyard ctl` does not send an `Origin` header, so it can call the same API from an SSH session.
+
+## CLI
+
+`switchyard ctl` (also installed as `switchyardctl`, or `python -m switchyard ctl`) talks to a **running** Switchyard over that dashboard JSON API. It does not start the arbiter, and it does not duplicate wake/sleep/unload logic.
+
+```sh
+# on the GPU box (dashboard defaults to 127.0.0.1:8100)
+switchyard ctl status
+switchyard ctl engines
+switchyard ctl wake qwen          # aliases: load, swap (give this engine the GPU)
+switchyard ctl sleep vision       # alias: unload
+switchyard ctl comfy-unload
+switchyard ctl budget             # VRAM / memory numbers the server exposes today
+switchyard ctl --json status      # --json also works after the command
+```
+
+`--host` / `--port` override the dashboard address. `SWITCHYARD_URL` (for example `http://127.0.0.1:8100`) is used when they are omitted. `--token` or `SWITCHYARD_TOKEN` is sent as `Authorization: Bearer …` and is harmless if the server ignores it.
+
+SSH from a laptop, with the dashboard staying on localhost:
+
+```sh
+ssh gpu-box 'switchyard ctl status'
+ssh gpu-box 'switchyardctl swap qwen'
+
+# or tunnel the dashboard and run ctl locally
+ssh -L 8100:127.0.0.1:8100 gpu-box
+export SWITCHYARD_URL=http://127.0.0.1:8100
+switchyard ctl status
+```
+
+Unreachable servers and HTTP errors print a short message on stderr and exit non-zero. Extra fields that later builds may add (GPU probe source, shared-VRAM budget, …) are shown when present and ignored when missing.
 
 ## Development
 
