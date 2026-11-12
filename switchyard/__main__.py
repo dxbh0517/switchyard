@@ -5,7 +5,7 @@ import signal
 import sys
 import time
 
-from . import __version__
+from . import __version__, analytics
 from .config import Settings
 from .dashboard import Dashboard
 from .events import log
@@ -13,6 +13,7 @@ from .events import log
 
 def main() -> None:
     settings = Settings()
+    analytics.configure(settings)
     log("switchyard", f"v{__version__}, settings file {settings.path}")
     components: dict = {"arbiter": None, "ovms": None, "stt": None}
     if settings.get("arbiter_enabled"):
