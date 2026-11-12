@@ -73,8 +73,11 @@ FIELDS: list[Field] = [
           help="Long audio is cut at the quietest point near each boundary."),
     # Dashboard -----------------------------------------------------------------
     Field("dashboard_host", "dashboard", "Listen host", "str", "127.0.0.1", "DASHBOARD_HOST", live=False,
-          help="The dashboard can change settings and has no login; keep it on localhost."),
+          help="127.0.0.1 keeps the dashboard local. 0.0.0.0 exposes it; set SWITCHYARD_TOKEN if you do."),
     Field("dashboard_port", "dashboard", "Listen port", "int", 8100, "DASHBOARD_PORT", live=False),
+    Field("dashboard_token", "dashboard", "API token", "str", "", "SWITCHYARD_TOKEN",
+          help="When set, every dashboard API call needs Authorization: Bearer <token>. "
+               "Required if the dashboard is reachable from other machines."),
 ]
 BY_KEY = {f.key: f for f in FIELDS}
 

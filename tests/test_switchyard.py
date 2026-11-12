@@ -11,11 +11,13 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
-from switchyard import config
+from switchyard import config, events
 from switchyard.arbiter import Arbiter, strip_images
+from switchyard.dashboard import Dashboard, EXPOSED_NO_TOKEN, is_loopback_host
 from switchyard.httputil import Server
 from switchyard.ovms_shim import OvmsShim, StreamThinkFilter, split_think
 from switchyard.stt import parse_multipart
@@ -279,6 +281,145 @@ class OvmsShimTests(unittest.TestCase):
             self.assertIn("<Document>: d", seen["/v3/rerank"]["documents"][0])
             up.shutdown()
             up.server_close()
+
+
+def httpjson(url, method="GET", body=None, headers=None):
+    h = dict(headers or {})
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        h.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, method=method, headers=h)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            raw = r.read()
+            return r.status, json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            obj = json.loads(raw) if raw else {}
+        except ValueError:
+            obj = {}
+        return e.code, obj
+
+
+class DashboardTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dash = None
+
+    def tearDown(self):
+        if self.dash and self.dash.server:
+            self.dash.server.shutdown()
+            self.dash.server.server_close()
+        self.tmp.cleanup()
+
+    def start_dash(self, host="127.0.0.1", token="", **updates):
+        port = free_port()
+        s = config.Settings(os.path.join(self.tmp.name, "s.json"))
+        s.update({"dashboard_host": host, "dashboard_port": port, "dashboard_token": token, **updates})
+        logged = events.since(0)
+        self.last_id = logged[-1]["id"] if logged else 0
+        self.dash = Dashboard(s, {"arbiter": None, "ovms": None, "stt": None})
+        self.dash.start()
+        time.sleep(0.15)
+        self.port = port
+        self.base = f"http://127.0.0.1:{port}"
+        return self.dash
+
+    def test_is_loopback_host(self):
+        for h in ("127.0.0.1", "127.0.0.2", "::1", "localhost", "[::1]"):
+            self.assertTrue(is_loopback_host(h), h)
+        for h in ("0.0.0.0", "::", "192.168.1.5", "10.0.0.1", "gpu.local"):
+            self.assertFalse(is_loopback_host(h), h)
+
+    def test_info_and_html_without_token(self):
+        self.start_dash()
+        code, info = httpjson(self.base + "/api/info")
+        self.assertEqual(code, 200)
+        self.assertEqual(info["auth_required"], False)
+        self.assertIn("version", info)
+        self.assertTrue(info["host"].endswith(f":{self.port}"))
+        code, _ = httpjson(self.base + "/api/status")
+        self.assertEqual(code, 200)
+        req = urllib.request.Request(self.base + "/")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn(b"Switchyard", r.read())
+
+    def test_auth_missing_wrong_correct(self):
+        self.start_dash(token="s3cret")
+        code, info = httpjson(self.base + "/api/info")
+        self.assertEqual(code, 200)
+        self.assertEqual(info["auth_required"], True)
+        req = urllib.request.Request(self.base + "/")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertEqual(r.status, 200)
+
+        code, body = httpjson(self.base + "/api/status")
+        self.assertEqual(code, 401)
+        self.assertEqual(body["error"], "unauthorized")
+        code, body = httpjson(self.base + "/api/status",
+                              headers={"Authorization": "Bearer wrong"})
+        self.assertEqual(code, 401)
+        code, body = httpjson(self.base + "/api/status",
+                              headers={"Authorization": "Bearer s3cret"})
+        self.assertEqual(code, 200)
+        self.assertIn("version", body)
+        code, _ = httpjson(self.base + "/api/settings",
+                           headers={"Authorization": "Bearer s3cret"})
+        self.assertEqual(code, 200)
+
+    def test_post_required_on_mutating(self):
+        self.start_dash()
+        for path in ("/api/action", "/api/restart"):
+            code, body = httpjson(self.base + path)
+            self.assertEqual(code, 405, path)
+            self.assertEqual(body["error"], "POST required")
+
+    def test_csrf_origin_or_custom_header(self):
+        self.start_dash(token="s3cret")
+        url = self.base + "/api/settings"
+        auth = {"Authorization": "Bearer s3cret"}
+        # No Origin and no X-Switchyard: refused.
+        code, body = httpjson(url, method="POST", body={"idle_sleep_sec": 90}, headers=auth)
+        self.assertEqual(code, 403)
+        self.assertEqual(body["error"], "cross-origin request refused")
+        # Foreign Origin, even with the custom header: refused.
+        code, _ = httpjson(url, method="POST", body={"idle_sleep_sec": 90},
+                           headers={**auth, "Origin": "http://evil.test", "X-Switchyard": "1"})
+        self.assertEqual(code, 403)
+        # Custom header, no Origin (curl / scripts).
+        code, body = httpjson(url, method="POST", body={"idle_sleep_sec": 91},
+                              headers={**auth, "X-Switchyard": "1"})
+        self.assertEqual(code, 200)
+        self.assertIn("idle_sleep_sec", body["changed"])
+        # Matching Origin, no custom header (browser).
+        origin = f"http://127.0.0.1:{self.port}"
+        code, body = httpjson(url, method="POST", body={"idle_sleep_sec": 92},
+                              headers={**auth, "Origin": origin})
+        self.assertEqual(code, 200)
+
+    def test_warning_non_loopback_without_token(self):
+        self.start_dash(host="0.0.0.0")
+        msgs = [e["msg"] for e in events.since(self.last_id)]
+        self.assertTrue(any("SWITCHYARD_TOKEN" in m and "not loopback" in m for m in msgs), msgs)
+        self.assertIn("0.0.0.0", EXPOSED_NO_TOKEN.format(host="0.0.0.0"))
+        code, info = httpjson(self.base + "/api/info")
+        self.assertEqual(code, 200)
+        self.assertEqual(info["auth_required"], False)
+        self.assertTrue(info["host"].startswith("0.0.0.0:"))
+
+    def test_no_warning_loopback_or_token(self):
+        self.start_dash(host="127.0.0.1")
+        msgs = [e["msg"] for e in events.since(self.last_id)]
+        self.assertFalse(any("SWITCHYARD_TOKEN is empty" in m for m in msgs), msgs)
+        if self.dash.server:
+            self.dash.server.shutdown()
+            self.dash.server.server_close()
+        self.start_dash(host="0.0.0.0", token="s3cret")
+        msgs = [e["msg"] for e in events.since(self.last_id)]
+        self.assertFalse(any("SWITCHYARD_TOKEN is empty" in m for m in msgs), msgs)
 
 
 if __name__ == "__main__":

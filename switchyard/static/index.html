@@ -33,6 +33,11 @@ h1{font-size:18px;margin:0;letter-spacing:-.01em;font-weight:650}
 .dot.off{background:var(--red);box-shadow:0 0 0 3px var(--red-soft)}
 .banner{display:none;align-items:center;justify-content:space-between;gap:12px;background:var(--amber-soft);color:var(--amber);border-radius:var(--r);padding:10px 14px;margin-bottom:16px;font-size:13px}
 .banner.show{display:flex}
+.banner.lan{background:var(--red-soft);color:var(--red)}
+.tokenbox{display:none;position:fixed;inset:0;background:rgba(28,27,25,.45);z-index:20;place-items:center;padding:20px}
+.tokenbox.show{display:grid}
+.tokenbox form{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:18px;width:min(360px,92vw);display:grid;gap:10px;box-shadow:var(--shadow)}
+.tokenbox h2{margin:0;font-size:15px}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
 .sec-t{font-size:11.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3);margin:26px 2px 10px}
 /* GPU hero */
@@ -130,9 +135,10 @@ input.dirty{border-color:var(--amber)}
       <div class="mark"><svg viewBox="0 0 18 18" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"><path d="M3 15 9 3l6 12"/><path d="M5.5 10h7"/></svg></div>
       <div><h1>Switchyard</h1><div class="sub">GPU arbiter · OVMS shim · speech to text</div></div>
     </div>
-    <div class="meta"><span class="hide-sm" id="ver"></span><span id="up"></span><span><i class="dot" id="conn"></i><span id="connt">live</span></span></div>
+    <div class="meta"><span class="hide-sm" id="ver"></span><span id="up"></span><span><i class="dot off" id="conn"></i><span id="connt">disconnected</span></span></div>
   </header>
 
+  <div class="banner lan" id="lanwarn"><span>This dashboard is reachable off localhost with no token. Set SWITCHYARD_TOKEN or use an SSH tunnel.</span></div>
   <div class="banner" id="banner"><span id="bannert">Some changes take effect after a restart.</span><button class="warn" id="restart">Restart now</button></div>
 
   <div class="panel gpu" id="gpu">
@@ -161,16 +167,60 @@ input.dirty{border-color:var(--amber)}
   <div class="panel"><div class="log" id="log"></div></div>
 </div>
 <div class="toast" id="toast"></div>
+<div class="tokenbox" id="tokenbox">
+  <form id="tokenform">
+    <h2>Dashboard token</h2>
+    <div class="help">This host requires <code>Authorization: Bearer</code>. Stored in this browser only.</div>
+    <input type="password" id="tokenin" autocomplete="current-password" placeholder="SWITCHYARD_TOKEN">
+    <button class="primary" type="submit">Use token</button>
+    <div class="help" id="tokenerr"></div>
+  </form>
+</div>
 
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const fmtDur = s => s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s/60)}m ${s%60}s` : `${Math.floor(s/3600)}h ${Math.floor(s%3600/60)}m`;
 const n = v => v == null ? "—" : Number.isInteger(v) ? v.toLocaleString() : (+v).toFixed(1);
+const TOKEN_KEY = "switchyard-token";
+let info = {host: location.host, auth_required: false, version: ""};
 
 function toast(msg){const t=$("#toast");t.textContent=msg;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),2200)}
-async function api(path, body){
-  const r = await fetch(path, body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+function headers(extra){
+  const h = {"X-Switchyard": "1", ...extra};
+  const t = localStorage.getItem(TOKEN_KEY);
+  if(t) h.Authorization = "Bearer " + t;
+  return h;
+}
+let asking = null;
+function askToken(msg){
+  if(asking) return asking;
+  $("#tokenerr").textContent = msg || "";
+  $("#tokenbox").classList.add("show");
+  $("#tokenin").value = localStorage.getItem(TOKEN_KEY) || "";
+  $("#tokenin").focus();
+  asking = new Promise(resolve => {
+    $("#tokenform").onsubmit = e => {
+      e.preventDefault();
+      const v = $("#tokenin").value.trim();
+      if(!v){ $("#tokenerr").textContent = "Token required"; return; }
+      localStorage.setItem(TOKEN_KEY, v);
+      $("#tokenbox").classList.remove("show");
+      asking = null;
+      resolve(v);
+    };
+  });
+  return asking;
+}
+async function api(path, body, retried){
+  const opt = {headers: headers(body === undefined ? {} : {"Content-Type":"application/json"})};
+  if(body !== undefined){ opt.method = "POST"; opt.body = JSON.stringify(body); }
+  const r = await fetch(path, opt);
+  if(r.status === 401 && !retried){
+    localStorage.removeItem(TOKEN_KEY);
+    await askToken("Token missing or wrong");
+    return api(path, body, true);
+  }
   const j = await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(j.error || r.statusText);
   return j;
@@ -241,13 +291,24 @@ document.addEventListener("click", e => {
   b.disabled = true; act(b.dataset.c || "arbiter", b.dataset.a, b.dataset.t);
 });
 
-let alive = true;
-async function pollStatus(){
-  try{ renderStatus(await api("/api/status")); setConn(true); }
-  catch(e){ setConn(false); }
-  setTimeout(pollStatus, 2000);
+let alive = false, statusWait = 2000, logWait = 2000;
+function loopbackBind(hostport){
+  let h = hostport || "";
+  if(h.startsWith("[")) h = h.slice(1, Math.max(1, h.indexOf("]")));
+  else h = h.split(":")[0];
+  return h === "127.0.0.1" || h === "localhost" || h === "::1";
 }
-function setConn(ok){ alive = ok; $("#conn").classList.toggle("off", !ok); $("#connt").textContent = ok ? "live" : "offline"; }
+function setConn(ok){
+  alive = ok;
+  $("#conn").classList.toggle("off", !ok);
+  const host = location.host || info.host || "";
+  $("#connt").textContent = (ok ? "connected" : "disconnected") + (host ? " · " + host : "");
+}
+async function pollStatus(){
+  try{ renderStatus(await api("/api/status")); setConn(true); statusWait = 2000; }
+  catch(e){ setConn(false); statusWait = Math.min(statusWait * 2, 16000); }
+  setTimeout(pollStatus, statusWait);
+}
 
 /* ---------- settings ---------- */
 let schema = null, draft = {}, tab = null;
@@ -343,11 +404,20 @@ async function pollLog(){
       while(box.children.length > 400) box.firstChild.remove();
       if(atBottom) box.scrollTop = box.scrollHeight;
     }
-  }catch(e){}
-  setTimeout(pollLog, 2000);
+  }catch(e){ logWait = Math.min(logWait * 2, 16000); return setTimeout(pollLog, logWait); }
+  logWait = 2000;
+  setTimeout(pollLog, logWait);
 }
 
-pollStatus(); pollLog(); loadSettings().catch(e => $("#fields").innerHTML = `<div class="empty">${esc(e.message)}</div>`);
+async function boot(){
+  try{ info = await fetch("/api/info").then(r => r.json()); }catch(e){}
+  setConn(false);
+  if(info.version) $("#ver").textContent = "v" + info.version;
+  if(!info.auth_required && !loopbackBind(info.host)) $("#lanwarn").classList.add("show");
+  if(info.auth_required && !localStorage.getItem(TOKEN_KEY)) await askToken();
+  pollStatus(); pollLog(); loadSettings().catch(e => $("#fields").innerHTML = `<div class="empty">${esc(e.message)}</div>`);
+}
+boot();
 </script>
 </body>
 </html>
