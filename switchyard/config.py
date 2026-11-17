@@ -58,7 +58,16 @@ FIELDS: list[Field] = [
           help="An awake engine with no traffic for this long goes back to sleep."),
     Field("sleep_level", "arbiter", "Sleep level", "choice", 2, "SLEEP_LEVEL", choices=(1, 2),
           help="1 keeps weights in CPU RAM (fast wake, uses RAM). 2 drops them (reload from disk)."),
-    Field("wake_attempts", "arbiter", "Wake attempts", "int", 3, "WAKE_ATTEMPTS", min=1, max=10),
+    Field("wake_attempts", "arbiter", "Wake attempts", "int", 3, "WAKE_ATTEMPTS", min=1, max=10,
+          help="How many times to try waking an engine before marking it unhealthy and returning HTTP 503."),
+    Field("wake_backoff_sec", "arbiter", "Wake retry backoff (s)", "float", 1.0, "WAKE_BACKOFF_SEC", min=0,
+          help="Initial delay between wake attempts; doubles after each failure (1s, 2s, 4s, …)."),
+    Field("health_interval_sec", "arbiter", "Health check interval (s)", "float", 15.0,
+          "HEALTH_INTERVAL_SEC", min=0.1,
+          help="How often to probe vLLM /health and ComfyUI /system_stats. Probes do not hold the arbiter lock."),
+    Field("health_timeout_sec", "arbiter", "Health check timeout (s)", "float", 5.0,
+          "HEALTH_TIMEOUT_SEC", min=0.05,
+          help="HTTP timeout for each health probe. Also used to verify the engine after a wake."),
     Field("comfy_free_wait_sec", "arbiter", "Wait for ComfyUI unload (s)", "float", 30.0,
           "COMFY_FREE_WAIT_SEC", min=0),
     Field("loading_max_sec", "arbiter", "Engine startup claim (s)", "int", 900, "LOADING_MAX_SEC", min=60,
@@ -91,8 +100,12 @@ FIELDS: list[Field] = [
           help="Long audio is cut at the quietest point near each boundary."),
     # Dashboard -----------------------------------------------------------------
     Field("dashboard_host", "dashboard", "Listen host", "str", "127.0.0.1", "DASHBOARD_HOST", live=False,
-          help="The dashboard can change settings and has no login; keep it on localhost."),
+          help="127.0.0.1 keeps the dashboard local. 0.0.0.0 exposes it; set SWITCHYARD_TOKEN if you do."),
     Field("dashboard_port", "dashboard", "Listen port", "int", 8100, "DASHBOARD_PORT", live=False),
+    Field("dashboard_token", "dashboard", "API token", "str", "", "SWITCHYARD_TOKEN",
+          help="When set, every dashboard API call needs Authorization: Bearer <token>. "
+               "Required if the dashboard is reachable from other machines. Write-only: "
+               "the current value is never shown here."),
 ]
 BY_KEY = {f.key: f for f in FIELDS}
 

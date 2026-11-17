@@ -13,6 +13,7 @@ import http.client
 import json
 import re
 import time
+import urllib.error
 import urllib.request
 
 from .events import log
@@ -45,6 +46,16 @@ class VllmBackend:
     def health(self) -> bool | None:
         sleeping = self.is_sleeping()
         return None if sleeping is None else True
+
+    def probe_health(self, timeout: float = 5.0) -> tuple[str, str | None]:
+        """GET /health -> ("healthy" | "unhealthy" | "unreachable", error)."""
+        try:
+            code, raw = self._simple("GET", "/health", timeout=timeout)
+            if code == 200:
+                return "healthy", None
+            return "unhealthy", f"HTTP {code}: {raw[:200]!r}"
+        except Exception as e:
+            return "unreachable", str(e)
 
     def is_sleeping(self) -> bool | None:
         try:
@@ -96,6 +107,19 @@ class ComfyBackend:
         except Exception:
             return None
 
+    def probe_health(self, timeout: float = 5.0) -> tuple[str, str | None]:
+        """GET /system_stats -> ("healthy" | "unhealthy" | "unreachable", error)."""
+        try:
+            with urllib.request.urlopen(f"{self.url()}/system_stats", timeout=timeout) as r:
+                if getattr(r, "status", 200) != 200:
+                    return "unhealthy", f"HTTP {r.status}"
+                json.load(r)
+                return "healthy", None
+        except urllib.error.HTTPError as e:
+            return "unhealthy", f"HTTP {e.code}"
+        except Exception as e:
+            return "unreachable", str(e)
+
     def wake(self, level: int = 2) -> None:  # noqa: ARG002
         return  # models load on demand
 
@@ -134,8 +158,10 @@ class ComfyBackend:
             return None, {"running": None, "pending": None}
 
     def unload(self, target_mb: float, require_idle: bool = False,
-               running=None, free_mb=None) -> None:
+               running=None, free_mb=None) -> dict:
         """POST /free and wait until free_mb() >= target_mb. No-op if ComfyUI is down.
+
+        Returns {"skipped": bool, "error": str | None, "free_mb": int | None} for telemetry.
 
         `running` and `free_mb` are callables so the arbiter can keep its queue/gpu
         snapshots in sync while we wait.
@@ -155,7 +181,7 @@ class ComfyBackend:
             log(C, f"ComfyUI /free skipped: {e}")
             if free_mb() is None:
                 log(C, "VRAM unknown; proceeding without a free-memory check", "warn")
-            return
+            return {"skipped": True, "error": str(e), "free_mb": None}
         deadline = time.time() + self.s.get("comfy_free_wait_sec")
         free, t = None, time.time()
         while time.time() < deadline:
@@ -167,6 +193,7 @@ class ComfyBackend:
                 break
             time.sleep(0.25)
         log(C, f"ComfyUI unloaded in {time.time() - t:.1f}s (GPU free {free and round(free)} MiB, want {target_mb})")
+        return {"skipped": False, "error": None, "free_mb": None if free is None else round(free)}
 
 
 # kind -> class. llama.cpp is not implemented; add it here when it is.

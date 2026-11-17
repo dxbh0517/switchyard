@@ -18,5 +18,5 @@ You should get an acknowledgement within a few days. Once a fix is available, we
 
 ## Notes for operators
 
-- The dashboard can change settings and has **no login**. Keep `DASHBOARD_HOST` on localhost (the default) or behind your own auth proxy.
+- The dashboard can change settings. Keep `DASHBOARD_HOST` on localhost (the default), or set `SWITCHYARD_TOKEN` if you bind it on the network. Prefer an SSH tunnel (`ssh -L`) or a reverse proxy that terminates TLS.
 - Switchyard proxies to configured upstreams (vLLM, ComfyUI, OVMS). Treat those URLs as trusted configuration, not as user input.
