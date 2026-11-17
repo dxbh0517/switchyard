@@ -20,6 +20,9 @@ Environment:
   DASHBOARD_HOST       Dashboard bind address (default: 127.0.0.1)
   LISTEN_HOST          Bind address for arbiter, OVMS shim, and STT
 
+Commands:
+  switchyard ctl ...   control a running Switchyard (see `switchyard ctl --help`)
+
 See the README for the full list.
 
 Warning: the dashboard has no auth and can change settings.
@@ -40,6 +43,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "ctl":
+        from .ctl import main as ctl_main
+        raise SystemExit(ctl_main(argv[1:], prog="switchyard ctl"))
     _parser().parse_args(argv)
     settings = Settings()
     log("switchyard", f"v{__version__}, settings file {settings.path}")
