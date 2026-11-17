@@ -49,7 +49,10 @@ def resolve_base(host: str | None, port: int | None) -> str:
             env_port = u.port
         elif scheme == "https":
             env_port = 443
-    return f"{scheme}://{host or env_host}:{port if port is not None else env_port}"
+    h = host or env_host
+    if ":" in h and not h.startswith("["):
+        h = f"[{h}]"  # bare IPv6 literal
+    return f"{scheme}://{h}:{port if port is not None else env_port}"
 
 
 def resolve_token(explicit: str | None) -> str | None:
@@ -65,7 +68,9 @@ class Client:
         self.timeout = timeout
 
     def headers(self) -> dict[str, str]:
-        h = {"Accept": "application/json", "User-Agent": f"switchyard-ctl/{__version__}"}
+        # X-Switchyard marks a non-browser client for the dashboard's CSRF check.
+        h = {"Accept": "application/json", "User-Agent": f"switchyard-ctl/{__version__}",
+             "X-Switchyard": "ctl"}
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
         return h

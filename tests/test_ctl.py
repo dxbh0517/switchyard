@@ -134,6 +134,9 @@ class ResolveTests(unittest.TestCase):
             self.assertEqual(resolve_base(None, None), "https://box:443")
             os.environ["SWITCHYARD_URL"] = "box:8123"
             self.assertEqual(resolve_base("127.0.0.1", None), "http://127.0.0.1:8123")
+            os.environ["SWITCHYARD_URL"] = "http://[::1]:8100"
+            self.assertEqual(resolve_base(None, None), "http://[::1]:8100")
+            self.assertEqual(resolve_base("::1", 9000), "http://[::1]:9000")
 
     def test_token_env(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -237,6 +240,7 @@ class FakeHttpTests(unittest.TestCase):
         code, out, err = run_main(["--token", "s3cret", "status"], self.env)
         self.assertEqual(code, 0, err)
         self.assertEqual(self.st["headers"][-1].get("Authorization"), "Bearer s3cret")
+        self.assertTrue(self.st["headers"][-1].get("X-Switchyard"), "CSRF marker for the dashboard")
         env = dict(self.env, SWITCHYARD_TOKEN="from-env")
         code, out, err = run_main(["status"], env)
         self.assertEqual(code, 0, err)
@@ -348,7 +352,11 @@ class EntryPointTests(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("budget", r.stdout)
-        r = subprocess.run([_console_script("switchyardctl"), "--help"],
+        try:
+            script = _console_script("switchyardctl")
+        except FileNotFoundError:
+            self.skipTest("switchyardctl is not installed (pip install -e .)")
+        r = subprocess.run([script, "--help"],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("wake", r.stdout)
