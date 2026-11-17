@@ -179,7 +179,11 @@ def _load_file(path: Path, package: bool) -> ModuleType:
         raise ImportError(f"cannot import {path}")
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(name, None)  # don't leave a half-initialized module behind
+        raise
     return mod
 
 

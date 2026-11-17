@@ -30,6 +30,15 @@ class Dashboard:
     def __init__(self, settings: Settings, components: dict):
         self.s = settings
         self.c = components   # name -> component (or None when disabled)
+        self._plugins = None  # discovered once; plugin sources come from env (restart-scoped)
+        self._plugins_lock = threading.Lock()
+
+    def plugins(self) -> dict:
+        # Discovery imports and runs plugin modules, so do it once rather than on every GET.
+        with self._plugins_lock:
+            if self._plugins is None:
+                self._plugins = discover().as_dict()
+            return self._plugins
 
     def status(self) -> dict:
         out = {"version": __version__, "uptime": round(time.time() - events.STARTED),
@@ -66,7 +75,7 @@ class Dashboard:
                     since = int((parse_qs(u.query).get("since") or ["0"])[0])
                     self.send_json(200, events.since(since))
                 elif u.path == "/api/plugins":
-                    self.send_json(200, discover().as_dict())
+                    self.send_json(200, dash.plugins())
                 else:
                     self.send_json(404, {"error": "not found"})
 

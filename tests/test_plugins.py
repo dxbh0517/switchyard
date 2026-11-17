@@ -254,6 +254,8 @@ class DiscoveryTests(unittest.TestCase):
             self.assertTrue(any(r.source == "entry_point" and r.status == "error" for r in reg.records))
             self.assertTrue(any(r.source == "config" and r.status == "error" for r in reg.records))
             self.assertEqual(set(reg.by_name()), {"good"})
+            self.assertFalse([m for m in sys.modules if m.startswith("_switchyard_plugin_boom_")],
+                             "a plugin that fails to import must not stay in sys.modules")
 
     def test_later_source_overrides_name(self):
         with tempfile.TemporaryDirectory() as d:
@@ -337,6 +339,19 @@ class PluginsApiTests(unittest.TestCase):
         self.assertEqual(dummy["kind"], "dummy")
         self.assertEqual(dummy["status"], "ok")
         self.assertIsNone(dummy["error"])
+
+    def test_dashboard_discovers_once(self):
+        from unittest.mock import patch
+
+        from switchyard.dashboard import Dashboard
+        with tempfile.TemporaryDirectory() as d:
+            s = config.Settings(os.path.join(d, "s.json"))
+            dash = Dashboard(s, {"arbiter": None, "ovms": None, "stt": None})
+            with patch("switchyard.dashboard.discover", wraps=discover) as disc:
+                first = dash.plugins()
+                second = dash.plugins()
+            self.assertIs(first, second)
+            disc.assert_called_once()
 
 
 def _free_port() -> int:
