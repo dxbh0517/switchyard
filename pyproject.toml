@@ -40,6 +40,7 @@ stt = [
   "transformers>=5.16.0",
   "numpy",
 ]
+nvml = ["nvidia-ml-py"]
 dev = []
 
 [project.urls]

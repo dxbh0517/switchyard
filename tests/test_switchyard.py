@@ -17,7 +17,7 @@ import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
-from switchyard import __version__, config
+from switchyard import __version__, config, events
 from switchyard.arbiter import Arbiter, strip_images
 from switchyard.backends import BACKENDS, ComfyBackend, VllmBackend
 from switchyard.budget import lru_victims, resolve_cost, usable_mb
@@ -195,6 +195,11 @@ class ConfigTests(unittest.TestCase):
                 s.update({"engines": [{"name": "a", "backend": "nohostport", "listen": 1}]})
             with self.assertRaises(ValueError):
                 s.update({"nope": 1})
+            s.update({"gpu_probe": "nvidia-smi", "gpu_index": 1})
+            self.assertEqual(s.get("gpu_probe"), "nvidia-smi")
+            self.assertEqual(s.get("gpu_index"), 1)
+            with self.assertRaises(ValueError):
+                s.update({"gpu_probe": "cuda"})
 
     def test_reset_creates_parent_and_drops_saved_key(self):
         with tempfile.TemporaryDirectory() as d:
@@ -268,7 +273,8 @@ class ArbiterTests(unittest.TestCase):
         self.la, self.lb = free_port(), free_port()
         s = config.Settings(os.path.join(self.tmp.name, "s.json"))
         s.update({"engines": f"a=127.0.0.1:{pa}@{self.la}:1000,b=127.0.0.1:{pb}@{self.lb}:1000",
-                  "text_only_engines": "a", "comfy_url": f"http://127.0.0.1:{pc}", "listen_host": "127.0.0.1"})
+                  "text_only_engines": "a", "comfy_url": f"http://127.0.0.1:{pc}", "listen_host": "127.0.0.1",
+                  "gpu_probe": "comfy"})
         self.arb = Arbiter(s)
         self.arb.start()
         time.sleep(0.3)
@@ -292,6 +298,10 @@ class ArbiterTests(unittest.TestCase):
         st = get(f"http://127.0.0.1:{self.la}/gpu/status")
         self.assertEqual(st["owner"], "b")
         self.assertEqual(st["engines"]["a"]["requests"], 1)
+        self.assertEqual(st["gpu"]["source"], "comfy")
+        self.assertEqual(st["gpu"]["free_mb"], round(30 * 2**30 / 2**20))
+        self.assertEqual(st["gpu"]["used_mb"], st["gpu"]["total_mb"] - st["gpu"]["free_mb"])
+        self.assertEqual(st["gpu"]["name"], "Fake GPU")
 
     def test_comfy_acquire_sleeps_engines(self):
         self.chat(self.la)
@@ -305,6 +315,17 @@ class ArbiterTests(unittest.TestCase):
     def test_text_only_strips_images(self):
         self.chat(self.la, [{"type": "image_url", "image_url": {"url": "data:x"}}])
         self.assertEqual(self.a_state["last_body"]["messages"][0]["content"][0]["type"], "text")
+
+    def test_wake_warns_when_vram_unknown(self):
+        self.arb.s.update({"gpu_probe": "off"})
+        self.arb.probe._cached = None
+        before = max((e["id"] for e in events.since(0)), default=0)
+        self.chat(self.la)
+        msgs = [e["msg"] for e in events.since(before)]
+        self.assertTrue(any("VRAM unknown" in m for m in msgs))
+        st = get(f"http://127.0.0.1:{self.la}/gpu/status")
+        self.assertEqual(st["gpu"]["source"], "off")
+        self.assertIsNone(st["gpu"]["free_mb"])
 
     def test_status_reports_exclusive_placement(self):
         st = get(f"http://127.0.0.1:{self.la}/gpu/status")
@@ -424,6 +445,19 @@ class EstimateTests(unittest.TestCase):
         self.assertGreater(partial, 0)
         self.assertLess(partial, full)
         self.assertEqual(quant, 32)
+
+    def test_head_dim_from_hidden_size_uses_attention_heads(self):
+        # 8B GQA: hidden 4096, 32 attention heads, 8 KV heads -> head_dim 128, not 512.
+        explicit = estimate_vram_mb(8_000_000_000, n_kv_heads=8, head_dim=128)
+        derived = estimate_vram_mb(8_000_000_000, n_kv_heads=8, hidden_size=4096, n_heads=32)
+        self.assertEqual(derived, explicit)
+
+    def test_unknown_quant_rejected_by_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = config.Settings(os.path.join(d, "s.json"))
+            with self.assertRaises(ValueError):
+                s.update({"engines": [{"name": "a", "backend": "127.0.0.1:1", "listen": 2,
+                                       "free_mb": 1, "n_params": 7_000_000_000, "quant": "q9_zz"}]})
 
     def test_estimate_from_engine_needs_params(self):
         self.assertIsNone(estimate_from_engine({"free_mb": 1000}))
@@ -562,6 +596,56 @@ class ArbiterSharedTests(unittest.TestCase):
         self.assertTrue(tb_done)
         self.assertTrue(self.a_state["sleeping"])
         self.assertFalse(self.b_state["sleeping"])
+
+    def test_draining_victim_does_not_starve_the_wake(self):
+        """While b waits for a to drain, new requests to a must queue, not join a."""
+        self.arb.s.update({"engines": [
+            {**self.arb.s.engine("a"), "vram_mb": 4000},
+            {**self.arb.s.engine("b"), "vram_mb": 4000},
+        ]})
+        self.chat(self.la)
+        gate = threading.Event()
+        self.a_state["hold"] = gate
+        ta = threading.Thread(target=lambda: self.chat(self.la))
+        ta.start()
+        self.assertTrue(wait_until(lambda: self.a_state["serving"]))
+        tb = threading.Thread(target=lambda: self.chat(self.lb))
+        tb.start()
+        self.assertTrue(wait_until(lambda: self.arb.state["switching"] == "b"))
+        self.assertIn("a", self.arb.state["evicting"])
+        ta2 = threading.Thread(target=lambda: self.chat(self.la))
+        ta2.start()
+        time.sleep(0.3)
+        self.assertEqual(self.arb.state["inflight"]["a"], 1, "late request to a must not be admitted")
+        gate.set()
+        for t in (ta, tb, ta2):
+            t.join(10)
+        self.assertEqual(self.arb.state["inflight"], {"a": 0, "b": 0})
+
+    def test_comfy_cannot_interleave_with_a_draining_switch(self):
+        self.arb.s.update({"engines": [
+            {**self.arb.s.engine("a"), "vram_mb": 4000},
+            {**self.arb.s.engine("b"), "vram_mb": 4000},
+        ]})
+        self.chat(self.la)
+        gate = threading.Event()
+        self.a_state["hold"] = gate
+        ta = threading.Thread(target=lambda: self.chat(self.la))
+        ta.start()
+        self.assertTrue(wait_until(lambda: self.a_state["serving"]))
+        tb = threading.Thread(target=lambda: self.chat(self.lb))
+        tb.start()
+        self.assertTrue(wait_until(lambda: self.arb.state["switching"] == "b"))
+        tc = threading.Thread(target=lambda: post(f"http://127.0.0.1:{self.la}/gpu/acquire"))
+        tc.start()
+        time.sleep(0.3)
+        self.assertEqual(self.arb.state["switching"], "b", "ComfyUI must not take over a reserved switch")
+        gate.set()
+        for t in (ta, tb, tc):
+            t.join(10)
+        self.assertEqual(self.arb.state["owner"], "comfy")
+        self.assertTrue(self.b_state["sleeping"])
+        post(f"http://127.0.0.1:{self.la}/gpu/release")
 
     def test_fast_path_does_not_probe_is_sleeping(self):
         self.chat(self.la)

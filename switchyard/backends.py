@@ -153,12 +153,17 @@ class ComfyBackend:
             urllib.request.urlopen(req, timeout=5).read()
         except Exception as e:
             log(C, f"ComfyUI /free skipped: {e}")
+            if free_mb() is None:
+                log(C, "VRAM unknown; proceeding without a free-memory check", "warn")
             return
         deadline = time.time() + self.s.get("comfy_free_wait_sec")
         free, t = None, time.time()
         while time.time() < deadline:
             free = free_mb()
-            if free is None or free >= target_mb:
+            if free is None:
+                log(C, "VRAM unknown after ComfyUI unload; proceeding without a free-memory check", "warn")
+                break
+            if free >= target_mb:
                 break
             time.sleep(0.25)
         log(C, f"ComfyUI unloaded in {time.time() - t:.1f}s (GPU free {free and round(free)} MiB, want {target_mb})")

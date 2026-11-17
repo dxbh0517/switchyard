@@ -35,6 +35,7 @@ from .budget import lru_victims, resolve_cost, usable_mb
 from .config import Settings
 from .estimate import estimate_from_engine
 from .events import Counters, log
+from .gpu import GpuProbe
 from .httputil import Handler, Server
 
 INFER_PREFIXES = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses",
@@ -91,7 +92,9 @@ class Arbiter:
         }
         self.sleeping: dict = {e: None for e in names}      # cached; occupancy HTTP updates it
         self.measured_mb: dict = {}                         # engine -> MiB observed after a wake
-        self.gpu: dict = {"free_mb": None, "total_mb": None, "name": None}
+        self.probe = GpuProbe(settings)
+        self.gpu: dict = {"free_mb": None, "used_mb": None, "total_mb": None,
+                          "name": None, "source": "unknown", "index": settings.get("gpu_index")}
         self.comfy_queue: dict = {"running": None, "pending": None}
         self.stats = {e: Counters() for e in names}
         self.servers: list = []
@@ -115,10 +118,14 @@ class Arbiter:
 
     def cost_of(self, engine: str) -> tuple[int, str]:
         cfg = self.live_engine(engine)
+        try:
+            estimated = estimate_from_engine(cfg)
+        except (ValueError, TypeError):  # e.g. an unknown quant name; fall back, don't 500
+            estimated = None
         return resolve_cost(
             self.measured_mb.get(engine),
             cfg.get("vram_mb"),
-            estimate_from_engine(cfg),
+            estimated,
             cfg.get("free_mb") or 0,
         )
 
@@ -224,6 +231,8 @@ class Arbiter:
         for attempt in range(1, attempts + 1):
             try:
                 before = self.gpu_free_mb()
+                if before is None and self.sleeping[engine]:
+                    log(C, f"waking {engine} with VRAM unknown", "warn")
                 self.wake(engine)
                 self._note_measured(engine, before)
                 return
@@ -244,10 +253,9 @@ class Arbiter:
 
     # ------------------------------------------------------------ ComfyUI
     def gpu_free_mb(self) -> float | None:
-        free, snap = self.comfy.vram()
-        if snap:
-            self.gpu.update(snap)
-        return free
+        self.gpu = self.probe.read().as_dict()
+        free = self.gpu.get("free_mb")
+        return None if free is None else float(free)
 
     def comfy_running(self) -> bool | None:
         running, info = self.comfy.queue()
@@ -284,15 +292,16 @@ class Arbiter:
                         return
                 break
 
-            while st["comfy_active"] or st["switching"] or self.loading_engines():
-                self.cond.wait(timeout=2)
+            # No ComfyUI claim, load or switch is pending here. Reserve the switch before
+            # draining the victims: cond.wait drops the lock, and without the reservation
+            # another switch, ComfyUI prompt or load could start in between. New requests
+            # to a victim see it in `evicting` and queue instead of starving this wake.
             victims = self._victims_locked(engine)
-            while any(st["inflight"][v] for v in victims):
-                self.cond.wait(timeout=2)
-                victims = self._victims_locked(engine)
             unload_comfy = st["owner"] not in self.engines
             reason = f"LRU for {engine}" if self.shared() else f"switching to {engine}"
             self._begin_switch(engine, victims)
+            while any(st["inflight"][v] for v in victims):
+                self.cond.wait(timeout=2)
 
         woke = False
         try:
@@ -304,7 +313,7 @@ class Arbiter:
                 if woke:
                     self._admit(engine)
                 else:
-                    st["owner"] = None
+                    st["owner"] = next((e for e in self.engines if self.sleeping[e] is False), None)
 
     def engine_exit(self, engine: str) -> None:
         with self.cond:
@@ -366,6 +375,8 @@ class Arbiter:
         if name == "sleep":
             def run():
                 with self.cond:
+                    while self.state["switching"]:  # never overwrite another transition
+                        self.cond.wait(timeout=2)
                     if self.state["inflight"][target]:
                         log(C, f"not sleeping {target}: requests in flight", "warn")
                         return

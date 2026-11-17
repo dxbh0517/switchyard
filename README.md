@@ -17,7 +17,7 @@ Share one NVIDIA GPU between several local AI services without them fighting ove
 
 ![Dashboard](docs/dashboard.png)
 
-Every part is optional, and nothing changes for clients: each one keeps its own port, so you can drop Switchyard in where separate proxies used to be. The arbiter and the shim only use the Python standard library. Speech to text adds `torch`, `transformers` and `ffmpeg`.
+Every part is optional, and nothing changes for clients: each one keeps its own port, so you can drop Switchyard in where separate proxies used to be. The arbiter and the shim only use the Python standard library. Speech to text adds `torch`, `transformers` and `ffmpeg`. An optional `nvml` extra (`nvidia-ml-py`) lets the arbiter read VRAM through NVML; without it, `nvidia-smi` or ComfyUI is used.
 
 ## How the GPU arbiter works
 
@@ -28,7 +28,7 @@ ComfyUI ──► POST /gpu/acquire ──────┘                   slee
 ```
 
 - **When a request arrives:** In the default exclusive mode, Switchyard waits for any ComfyUI job and for other engines' requests to finish, puts the current owner to sleep or asks ComfyUI to unload, then wakes the requested engine and forwards the request. Responses are streamed, so SSE works.
-- **Shared VRAM (`SHARED_VRAM=true`):** engines that already fit stay awake and serve in parallel. A wake that would exceed the card budget minus `VRAM_SAFETY_MB` waits only for the least-recently used victim's in-flight requests, then evicts it. Occupancy HTTP (sleep/wake/ComfyUI) does not hold the arbiter lock. ComfyUI still takes the whole GPU for a prompt. If the budget is unknown (no `VRAM_BUDGET_MB` and ComfyUI has not reported total VRAM), shared mode falls back to exclusive eviction.
+- **Shared VRAM (`SHARED_VRAM=true`):** engines that already fit stay awake and serve in parallel. A wake that would exceed the card budget minus `VRAM_SAFETY_MB` waits only for the least-recently used victim's in-flight requests, then evicts it. Occupancy HTTP (sleep/wake/ComfyUI) does not hold the arbiter lock. ComfyUI still takes the whole GPU for a prompt. If the budget is unknown (no `VRAM_BUDGET_MB` and the VRAM probe has no total), shared mode falls back to exclusive eviction.
 - **After `IDLE_SLEEP_SEC` without traffic:** that engine goes back to sleep, and the VRAM is free for whatever comes next.
 - **Sleep levels:**
   - Level 2 drops the weights and reloads them from disk (the page cache when warm). Each sleeping engine keeps under 1 GiB of VRAM.
@@ -36,6 +36,7 @@ ComfyUI ──► POST /gpu/acquire ──────┘                   slee
 - **ComfyUI jobs:** the hook in [`comfyui_node/`](comfyui_node/gpu_arbiter) calls `/gpu/acquire` before each prompt and `/gpu/release` after it. If Switchyard can't be reached, ComfyUI runs normally.
 - **Engine startup:** an engine container calls `POST /gpu/loading?engine=NAME` before it starts `vllm serve`. Loads are serialized, and each engine is put to sleep as soon as it is up.
 - **Text-only engines:** image parts in requests to a text-only engine are replaced with a short note, so the request doesn't fail with HTTP 400.
+- **VRAM:** free/used/total are read from the GPU when possible (NVML, then `nvidia-smi`), with ComfyUI `/system_stats` as a fallback. `/gpu/status` and the dashboard show the reading and which source produced it. If nothing can be read, wake and unload log a warning and continue.
 
 ## Quick start
 
@@ -71,6 +72,7 @@ python3 -m pip install -e .
 python3 -m switchyard --help     # env vars and dashboard bind warning
 python3 -m switchyard            # start; same as the `switchyard` console script
 # Optional STT: python3 -m pip install -e ".[stt]"  (also needs ffmpeg)
+# Optional NVML VRAM probe: python3 -m pip install -e ".[nvml]"
 ```
 
 `ENGINES` is a comma-separated list of `name=backend_host:port@listen_port:free_MiB[:vram_MiB]`. `free_MiB` is the free-VRAM target used before a wake (and the cost fallback). Optional `vram_MiB` is that engine's resident cost for shared placement. Clients send their requests to the listen port.
@@ -106,7 +108,9 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | `ARBITER_ENABLED` | `true` | restart | Turns the arbiter on or off. |
 | `ENGINES` | `qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500` | restart | The vLLM engines sharing the GPU. Optional fifth field is `vram_mb`. `free_mb` and `vram_mb` apply live. |
 | `TEXT_ONLY_ENGINES` | `qwen` | live | Comma-separated. Image parts sent to these engines are replaced with a note. |
-| `COMFY_URL` | `http://127.0.0.1:8188` | live | ComfyUI address. Used to read VRAM, check the queue and unload models. |
+| `COMFY_URL` | `http://127.0.0.1:8188` | live | ComfyUI address. Used to check the queue, unload models, and as a fallback VRAM probe. |
+| `GPU_PROBE` | `auto` | live | How to read VRAM: `auto` (NVML → nvidia-smi → ComfyUI), or force `nvml` / `nvidia-smi` / `comfy`, or `off`. |
+| `GPU_INDEX` | `0` | live | Which NVIDIA GPU to read. Single-card hosts leave this at 0. |
 | `LISTEN_HOST` | `0.0.0.0` | restart | Address the arbiter, OVMS shim, and STT servers bind to. |
 | `IDLE_SLEEP_SEC` | `120` | live | An awake engine with no traffic for this long goes back to sleep. |
 | `SLEEP_LEVEL` | `2` | live | `1` keeps weights in CPU RAM (fast wake). `2` drops them (reload from disk). |
@@ -114,7 +118,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | `COMFY_FREE_WAIT_SEC` | `30` | live | How long to wait for ComfyUI's unload to free the target VRAM. |
 | `LOADING_MAX_SEC` | `900` | live | How long a starting engine may hold the GPU before its claim expires. |
 | `SHARED_VRAM` | `false` | live | Off: one occupant (today's behavior). On: keep several engines resident while they fit the budget; those engines serve in parallel. |
-| `VRAM_BUDGET_MB` | `0` | live | Card size in MiB for shared placement. `0` = use the total VRAM ComfyUI reports. |
+| `VRAM_BUDGET_MB` | `0` | live | Card size in MiB for shared placement. `0` = use the total from the VRAM probe (`GPU_PROBE`). |
 | `VRAM_SAFETY_MB` | `1024` | live | Headroom subtracted from the budget so a wake does not OOM. |
 
 **OVMS shim**

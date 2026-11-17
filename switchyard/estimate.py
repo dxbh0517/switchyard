@@ -65,7 +65,7 @@ def _infer_shape(n_params: int) -> dict:
 def breakdown(n_params: int, quant: str = "fp16", context_length: int = 4096,
               n_layers: int | None = None, n_kv_heads: int | None = None,
               head_dim: int | None = None, hidden_size: int | None = None,
-              kv_quant: str | None = None) -> dict:
+              kv_quant: str | None = None, n_heads: int | None = None) -> dict:
     """Weights + KV cache + overhead, in MiB. n_params is the raw parameter count."""
     n_params = int(n_params)
     if n_params <= 0:
@@ -75,8 +75,10 @@ def breakdown(n_params: int, quant: str = "fp16", context_length: int = 4096,
     n_kv_heads = int(n_kv_heads or inferred["n_kv_heads"])
     if head_dim is not None:
         head_dim = int(head_dim)
-    elif hidden_size:
-        head_dim = int(hidden_size) // max(1, n_kv_heads)
+    elif hidden_size and n_heads:
+        # head_dim is hidden_size over the *attention* heads; with GQA there are
+        # fewer KV heads, so dividing by n_kv_heads would overstate the KV cache.
+        head_dim = int(hidden_size) // max(1, int(n_heads))
     else:
         head_dim = int(inferred["head_dim"])
     context_length = int(context_length)
@@ -97,12 +99,12 @@ def breakdown(n_params: int, quant: str = "fp16", context_length: int = 4096,
 def estimate_vram_mb(n_params: int, quant: str = "fp16", context_length: int = 4096,
                      n_layers: int | None = None, n_kv_heads: int | None = None,
                      head_dim: int | None = None, hidden_size: int | None = None,
-                     kv_quant: str | None = None) -> int:
+                     kv_quant: str | None = None, n_heads: int | None = None) -> int:
     """Predicted resident VRAM in MiB (rounded)."""
     return int(round(breakdown(
         n_params, quant=quant, context_length=context_length, n_layers=n_layers,
         n_kv_heads=n_kv_heads, head_dim=head_dim, hidden_size=hidden_size,
-        kv_quant=kv_quant)["total_mb"]))
+        kv_quant=kv_quant, n_heads=n_heads)["total_mb"]))
 
 
 def gpu_layers_that_fit(vram_mb: int, n_params: int, n_layers: int | None = None,
@@ -136,7 +138,7 @@ def estimate_from_engine(cfg: dict) -> int | None:
     ctx = cfg.get("context_length", cfg.get("context"))
     if ctx:
         kw["context_length"] = int(ctx)
-    for k in ("n_layers", "n_kv_heads", "head_dim", "hidden_size"):
+    for k in ("n_layers", "n_kv_heads", "n_heads", "head_dim", "hidden_size"):
         if cfg.get(k) not in (None, ""):
             kw[k] = int(cfg[k])
     if cfg.get("kv_quant"):

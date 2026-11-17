@@ -12,6 +12,8 @@ import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .estimate import quant_bytes
+
 
 @dataclass(frozen=True)
 class Field:
@@ -44,7 +46,13 @@ FIELDS: list[Field] = [
                "Name, backend and listen port changes need a restart; free_mb and vram_mb apply live."),
     Field("text_only_engines", "arbiter", "Text-only engines", "str", "qwen", "TEXT_ONLY_ENGINES",
           help="Comma-separated. Image parts sent to these engines are replaced with a note."),
-    Field("comfy_url", "arbiter", "ComfyUI URL", "str", "http://127.0.0.1:8188", "COMFY_URL"),
+    Field("comfy_url", "arbiter", "ComfyUI URL", "str", "http://127.0.0.1:8188", "COMFY_URL",
+          help="Queue, model unload, and last-resort VRAM probe via /system_stats."),
+    Field("gpu_probe", "arbiter", "VRAM probe", "choice", "auto", "GPU_PROBE",
+          choices=("auto", "nvml", "nvidia-smi", "comfy", "off"),
+          help="auto tries NVML, then nvidia-smi, then ComfyUI. off disables probing."),
+    Field("gpu_index", "arbiter", "GPU index", "int", 0, "GPU_INDEX", min=0,
+          help="Which NVIDIA GPU to read. Single-card hosts leave this at 0."),
     Field("listen_host", "arbiter", "Listen host", "str", "0.0.0.0", "LISTEN_HOST", live=False),
     Field("idle_sleep_sec", "arbiter", "Sleep after idle (s)", "int", 120, "IDLE_SLEEP_SEC", min=10,
           help="An awake engine with no traffic for this long goes back to sleep."),
@@ -61,7 +69,7 @@ FIELDS: list[Field] = [
                "evicts least-recently used (after that victim's in-flight requests drain). "
                "ComfyUI still takes the whole GPU."),
     Field("vram_budget_mb", "arbiter", "VRAM budget (MiB)", "int", 0, "VRAM_BUDGET_MB", min=0,
-          help="Card size used for shared placement. 0 = use the total VRAM ComfyUI reports."),
+          help="Card size used for shared placement. 0 = use the total from the VRAM probe."),
     Field("vram_safety_mb", "arbiter", "VRAM safety margin (MiB)", "int", 1024, "VRAM_SAFETY_MB", min=0,
           help="Headroom left unused so a wake or a ComfyUI prompt does not OOM. "
                "Usable budget is vram_budget_mb minus this."),
@@ -119,18 +127,21 @@ def _coerce(f: Field, value):
                 raise ValueError(f"bad engine entry: {e}")
             seen.add(name)
             e.update(name=name, listen=int(e["listen"]), free_mb=int(e.get("free_mb") or 0))
-            for k in ("vram_mb", "n_params", "n_layers", "n_kv_heads", "head_dim",
+            for k in ("vram_mb", "n_params", "n_layers", "n_kv_heads", "n_heads", "head_dim",
                       "hidden_size", "context_length"):
                 if e.get(k) not in (None, ""):
                     e[k] = int(float(e[k]))
-            if e.get("quant"):
-                e["quant"] = str(e["quant"])
+            for k in ("quant", "kv_quant"):
+                if e.get(k):
+                    e[k] = str(e[k])
+                    quant_bytes(e[k])  # unknown quant -> ValueError at save time, not at wake
         return engines
     if f.type == "bool":
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
-    if f.type in ("int", "choice"):
+    numeric_choice = f.type == "choice" and f.choices and isinstance(next(iter(f.choices)), int)
+    if f.type == "int" or numeric_choice:
         value = int(value)
     elif f.type == "float":
         value = float(value)
