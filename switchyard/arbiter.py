@@ -28,6 +28,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
+from . import analytics  # record_health_check / record_oom / record_evict: hook points for later PRs
 from .config import Settings
 from .events import Counters, log
 from .gpu import GpuProbe
@@ -206,6 +207,10 @@ class Arbiter:
             extra = f": {slot['last_error']}" if slot["last_error"] else ""
             log(C, f"{name} health {prev} → {slot['status']}{extra}",
                 "info" if status == "healthy" else "error")
+            # Transitions only: a row per probe would be thousands a day per engine.
+            analytics.record_health_check(
+                "comfy" if name == "ComfyUI" else name, ok=status == "healthy",
+                details={"from": prev, "to": slot["status"], "error": slot["last_error"]})
 
     def _mark_unhealthy(self, engine: str, error: str) -> None:
         self._record_health(self.health[engine], engine, "unhealthy", error)
@@ -243,7 +248,7 @@ class Arbiter:
                 log(C, f"waking {engine} with VRAM unknown", "warn")
             level = self.state["sleep_level"][engine]
             log(C, f"waking {engine} (from level {level})")
-            t = time.time()
+            t, vram_b, ram_b = time.time(), self.vram_used_mb(), analytics.ram_used_mb()
             if level >= 2:
                 # Level 2 discarded the weights: re-allocate, reload from disk (page cache
                 # when warm), then restore the KV cache and drop stale prefixes.
@@ -259,6 +264,8 @@ class Arbiter:
             self.stats[engine].inc("wakes")
             self.stats[engine].set("last_wake_sec", round(took, 1))
             log(C, f"{engine} awake in {took:.1f}s")
+            self._emit("wake", engine, t0=t, vram_before=vram_b, ram_before=ram_b,
+                       details={"level": level})
         self.sleeping[engine] = False
         status, err = self.probe_engine_health(engine)
         if status != "healthy":
@@ -269,11 +276,18 @@ class Arbiter:
         if self.is_sleeping(engine) is False:
             level = self.s.get("sleep_level")
             log(C, f"sleeping {engine} level={level} ({reason})")
-            t = time.time()
-            self._ok(self.backend_simple(engine, "POST", f"/sleep?level={level}", timeout=300), "sleep")
+            t, vram_b, ram_b = time.time(), self.vram_used_mb(), analytics.ram_used_mb()
+            try:
+                self._ok(self.backend_simple(engine, "POST", f"/sleep?level={level}", timeout=300), "sleep")
+            except Exception as e:
+                self._emit("error", engine, t0=t, vram_before=vram_b, ram_before=ram_b,
+                           details={"op": "sleep", "reason": reason, "error": str(e)})
+                raise
             self.state["sleep_level"][engine] = level
             self.stats[engine].inc("sleeps")
             log(C, f"{engine} asleep in {time.time() - t:.1f}s")
+            self._emit("sleep", engine, t0=t, vram_before=vram_b, ram_before=ram_b,
+                       details={"level": level, "reason": reason})
         self.sleeping[engine] = True
 
     def sleep_others(self, keep: str | None, reason: str) -> None:
@@ -294,6 +308,29 @@ class Arbiter:
         free = self.gpu.get("free_mb")
         return None if free is None else float(free)
 
+    def vram_used_mb(self) -> int | None:
+        """Cached used VRAM (MiB). None when the poller has not filled gpu yet."""
+        if self.gpu.get("used_mb") is not None:  # NVML / nvidia-smi report it directly
+            return int(self.gpu["used_mb"])
+        total, free = self.gpu.get("total_mb"), self.gpu.get("free_mb")
+        if total is None or free is None:
+            return None
+        try:
+            return max(0, int(total) - int(free))
+        except (TypeError, ValueError):
+            return None
+
+    def _emit(self, kind: str, engine: str | None = None, *, t0: float | None = None,
+              vram_before: int | None = None, ram_before: int | None = None,
+              details: dict | None = None) -> None:
+        """Queue a telemetry event. Safe under self.cond: no sqlite I/O."""
+        duration_ms = None if t0 is None else int(round((time.time() - t0) * 1000))
+        analytics.emit(
+            kind, engine=engine, duration_ms=duration_ms, details=details,
+            vram_before_mb=vram_before, vram_after_mb=self.vram_used_mb(),
+            ram_before_mb=ram_before, ram_after_mb=analytics.ram_used_mb(),
+        )
+
     def comfy_running(self) -> bool | None:
         try:
             q = self._comfy_get("/queue")
@@ -308,6 +345,7 @@ class Arbiter:
         if require_idle:
             while self.comfy_running():  # prompts the hook didn't register
                 time.sleep(5)
+        t, vram_b, ram_b = time.time(), self.vram_used_mb(), analytics.ram_used_mb()
         try:
             req = urllib.request.Request(f"{self.comfy_url()}/free",
                                          data=json.dumps({"unload_models": True, "free_memory": True}).encode(),
@@ -317,9 +355,11 @@ class Arbiter:
             log(C, f"ComfyUI /free skipped: {e}")
             if self.gpu_free_mb() is None:
                 log(C, "VRAM unknown; proceeding without a free-memory check", "warn")
+            self._emit("unload", "comfy", t0=t, vram_before=vram_b, ram_before=ram_b,
+                       details={"skipped": True, "target_mb": target_mb, "error": str(e)})
             return
         deadline = time.time() + self.s.get("comfy_free_wait_sec")
-        free, t = None, time.time()
+        free = None
         while time.time() < deadline:
             free = self.gpu_free_mb()
             if free is None:
@@ -329,6 +369,8 @@ class Arbiter:
                 break
             time.sleep(0.25)
         log(C, f"ComfyUI unloaded in {time.time() - t:.1f}s (GPU free {free and round(free)} MiB, want {target_mb})")
+        self._emit("unload", "comfy", t0=t, vram_before=vram_b, ram_before=ram_b,
+                   details={"target_mb": target_mb, "free_mb": None if free is None else round(free)})
 
     # ------------------------------------------------------------ ownership
     def engine_enter(self, engine: str) -> None:
@@ -361,16 +403,24 @@ class Arbiter:
                         except Exception as e:
                             log(C, f"wake {engine} failed (attempt {attempt}/{attempts}): {e}", "error")
                             if attempt == attempts:
+                                analytics.record_wake_failure(
+                                    engine, error=str(e),
+                                    details={"attempt": attempt, "attempts": attempts})
                                 self._mark_unhealthy(engine, str(e))
                                 st["owner"] = None
                                 self.cond.notify_all()
                                 raise RuntimeError(f"{engine} could not wake: {e}") from e
+                            analytics.record_wake_retry(
+                                engine, attempt=attempt, error=str(e),
+                                details={"attempts": attempts, "backoff_sec": delay})
                             self.comfy_unload(target)
                             time.sleep(delay)
                             delay *= 2
                 finally:
                     self.waking.discard(engine)
                 st["owner"] = engine
+                if prev and prev != engine:
+                    self._emit("swap", engine, details={"from": prev, "to": engine})
             self._raise_if_unavailable(engine)
             st["inflight"][engine] += 1
             st["last_infer"][engine] = time.time()
@@ -387,9 +437,12 @@ class Arbiter:
             while self.any_inflight() or self.loading_engines():
                 self.cond.wait(timeout=5)
             if self.state["owner"] != "comfy":
+                prev = self.state["owner"]
                 self.sleep_others(None, "ComfyUI prompt")
                 self.state["owner"] = "comfy"
                 log(C, "ComfyUI owns the GPU")
+                if prev:
+                    self._emit("swap", "comfy", details={"from": prev, "to": "comfy"})
 
     def comfy_release(self) -> None:
         with self.cond:
@@ -411,6 +464,7 @@ class Arbiter:
             st["owner"] = None
             log(C, f"{engine} is loading")
             self.sleep_others(engine, f"{engine} loading")
+        self._emit("load", engine, details={"renew": renew, "free_mb": self.free_mb(engine)})
         self.comfy_unload(self.free_mb(engine), require_idle=not renew)
 
     # ------------------------------------------------------------ dashboard actions
@@ -455,6 +509,7 @@ class Arbiter:
             fn()
         except Exception as e:
             log(C, f"{name} failed: {e}", "error")
+            analytics.emit("error", details={"op": name, "error": str(e)})
 
     def status(self) -> dict:
         st, now = self.state, time.time()

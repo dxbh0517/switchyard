@@ -7,6 +7,7 @@ GET  /api/plugins               discovered engine adapters (read-only; not used 
 POST /api/settings              {"key": value, ...}
 POST /api/action                {"component": "arbiter|stt", "action": "...", "target": "..."}
 GET  /api/logs?since=ID         activity log
+GET  /api/history?limit=&since=&kind=&engine=   analytics events + summary
 POST /api/restart               exit; the container's restart policy starts it again
 
 When SWITCHYARD_TOKEN is set, every /api/* path except /api/info needs
@@ -25,7 +26,7 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__, events
+from . import __version__, analytics, events
 from .config import Settings
 from .events import log
 from .httputil import Handler, Server
@@ -118,6 +119,7 @@ class Dashboard:
         self.server: Server | None = None
         self._plugins = None  # discovered once; plugin sources come from env (restart-scoped)
         self._plugins_lock = threading.Lock()
+        analytics.configure_if_needed(settings)
 
     def token(self) -> str:
         return (self.s.get("dashboard_token") or "").strip()
@@ -207,6 +209,19 @@ class Dashboard:
                     self.send_json(200, events.since(since))
                 elif u.path == "/api/plugins":
                     self.send_json(200, dash.plugins())
+                elif u.path == "/api/history":
+                    qs = parse_qs(u.query)
+                    def q(name, default=None):
+                        return (qs.get(name) or [default])[0]
+                    try:
+                        limit = int(q("limit", "100"))
+                        payload = analytics.get().history(
+                            limit=limit, since=q("since") or None,
+                            kind=q("kind") or None, engine=q("engine") or None)
+                    except (ValueError, TypeError) as e:
+                        self.send_json(400, {"error": str(e)})
+                        return
+                    self.send_json(200, payload)
                 else:
                     self.send_json(404, {"error": "not found"})
 

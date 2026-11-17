@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
-from switchyard import __version__, config, events
+from switchyard import __version__, analytics, config, events
 from switchyard.arbiter import Arbiter, strip_images
 from switchyard.dashboard import Dashboard, EXPOSED_NO_TOKEN, is_loopback_host
 from switchyard.httputil import Server
@@ -242,6 +242,7 @@ class ArbiterTests(unittest.TestCase):
         time.sleep(0.3)
 
     def tearDown(self):
+        analytics.reset()
         for srv in [s for s, _ in self.srv] + self.arb.servers:
             srv.shutdown()
             srv.server_close()
@@ -288,6 +289,14 @@ class ArbiterTests(unittest.TestCase):
         st = get(f"http://127.0.0.1:{self.la}/gpu/status")
         self.assertEqual(st["gpu"]["source"], "off")
         self.assertIsNone(st["gpu"]["free_mb"])
+
+    def test_wake_records_analytics(self):
+        analytics.configure(self.arb.s, path=os.path.join(self.tmp.name, "analytics.sqlite"))
+        self.chat(self.la)
+        analytics.get().flush()
+        kinds = [e["kind"] for e in analytics.history()["events"]]
+        self.assertIn("wake", kinds)
+        self.assertIn("unload", kinds)
 
 
 class OvmsShimTests(unittest.TestCase):

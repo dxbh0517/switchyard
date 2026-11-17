@@ -96,6 +96,8 @@ To install the ComfyUI hook, copy `comfyui_node/gpu_arbiter` into `ComfyUI/custo
 
 Without Docker, run `python3 -m switchyard`. Set `SWITCHYARD_SETTINGS` to say where the settings file goes. `python3 -m switchyard --help` (or `switchyard --help`) prints the version, the subcommands (`ctl`, `tray`, `update`), key environment variables, and a reminder to keep the dashboard on localhost or set `SWITCHYARD_TOKEN`. `--version` prints the version and exits.
 
+Telemetry of wake/sleep/load/unload and errors is stored in sqlite next to the settings file (`analytics.sqlite`). Set `SWITCHYARD_ANALYTICS_DB` to pick a path, or `SWITCHYARD_ANALYTICS=off` to disable it. Read it with `GET /api/history`.
+
 ## Settings
 
 Settings come from three places. A value saved in the dashboard (written to `/data/settings.json`) overrides the environment variable, which overrides the built-in default. The dashboard marks each setting **live** (takes effect at once) or **restart** (applies after a restart; use the dashboard's *Restart* button).
@@ -159,7 +161,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | engine ports | `POST /gpu/loading?engine=NAME` | engine startup claim |
 | `OVMS_SHIM_PORT` | `/v1/*`, `/v1/rerank` | OVMS with OpenAI compatibility fixes |
 | `STT_PORT` | `POST /v1/audio/transcriptions`, `GET /v1/models`, `/health` | speech to text |
-| `DASHBOARD_PORT` | `/`, `/api/info`, `/api/status`, `/api/settings`, `/api/plugins`, `/api/action`, `/api/logs`, `/api/restart` | dashboard |
+| `DASHBOARD_PORT` | `/`, `/api/info`, `/api/status`, `/api/settings`, `/api/plugins`, `/api/action`, `/api/logs`, `/api/history`, `/api/restart` | dashboard |
 
 `GET /api/info` is unauthenticated (`version`, bind `host`, `auth_required`). Everything else under `/api/` needs the bearer token when `SWITCHYARD_TOKEN` is set. Mutating paths accept `POST` only, plus a same-origin `Origin` or the `X-Switchyard` header.
 
