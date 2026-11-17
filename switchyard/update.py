@@ -20,7 +20,9 @@ from . import __version__
 GITHUB_REPO = "dxbh0517/switchyard"
 RELEASES_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 TAGS_URL = f"https://api.github.com/repos/{GITHUB_REPO}/tags?per_page=30"
-PYPI_URL = "https://pypi.org/pypi/switchyard/json"
+# Always install from the GitHub tag. The "switchyard" name on PyPI belongs to an
+# unrelated project (a networking framework), so a PyPI lookup could install the
+# wrong package if a version number ever matched.
 GIT_SPEC = f"git+https://github.com/{GITHUB_REPO}.git@{{tag}}"
 
 
@@ -38,7 +40,6 @@ class UpdateInfo:
     kind: str = "ok"          # ok | none | error
     message: str = ""
     install: str = "pip"      # pip | docker | source
-    via_pypi: bool = False
     url: str = f"https://github.com/{GITHUB_REPO}/releases"
 
     def lines(self) -> str:
@@ -89,10 +90,23 @@ def detect_install(environ: dict | None = None, dockerenv: str = "/.dockerenv") 
     except OSError:
         pass
     try:
-        importlib.metadata.distribution("switchyard")
-        return "pip"
+        dist = importlib.metadata.distribution("switchyard")
     except importlib.metadata.PackageNotFoundError:
         return "source"
+    return "source" if _is_editable(dist) else "pip"
+
+
+def _is_editable(dist) -> bool:
+    """`pip install -e .` records dir_info.editable in direct_url.json (PEP 610).
+
+    Upgrading that from a git tag would replace the user's working tree install
+    with a frozen copy, so editable installs are treated as source checkouts.
+    """
+    try:
+        raw = dist.read_text("direct_url.json")
+        return bool(raw and json.loads(raw).get("dir_info", {}).get("editable"))
+    except (ValueError, AttributeError, OSError):
+        return False
 
 
 def _headers() -> dict:
@@ -173,20 +187,6 @@ def _from_tags(payload) -> tuple[str, str] | None:
     return best[1], best[2]
 
 
-def pypi_has(version: str, opener=None) -> bool:
-    try:
-        status, payload, _ = _http_json(PYPI_URL, opener=opener)
-    except CheckError:
-        return False
-    if status != 200 or not isinstance(payload, dict):
-        return False
-    releases = payload.get("releases")
-    if isinstance(releases, dict) and version in releases:
-        return True
-    info = payload.get("info")
-    return isinstance(info, dict) and str(info.get("version")) == version
-
-
 def check(current: str | None = None, opener=None, install: str | None = None) -> UpdateInfo:
     current = current or __version__
     info = UpdateInfo(current=current, install=install or detect_install())
@@ -233,10 +233,8 @@ def check(current: str | None = None, opener=None, install: str | None = None) -
     if not info.available:
         info.message = f"Already up to date ({current})."
     else:
-        info.via_pypi = pypi_has(info.latest or "", opener=opener)
         if info.install == "pip":
-            src = "PyPI" if info.via_pypi else f"git tag {info.tag}"
-            info.message = f"A newer version is available. pip will install from {src}."
+            info.message = f"A newer version is available. pip will install git tag {info.tag}."
         elif info.install == "docker":
             info.message = (
                 "This looks like a Docker install. Rebuild the image or pull a new tag; "
@@ -251,8 +249,6 @@ def check(current: str | None = None, opener=None, install: str | None = None) -
 
 
 def pip_spec(info: UpdateInfo) -> str:
-    if info.via_pypi and info.latest:
-        return f"switchyard=={info.latest}"
     tag = info.tag or info.latest
     if not tag:
         raise CheckError("no tag to install")

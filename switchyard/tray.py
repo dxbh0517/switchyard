@@ -1,6 +1,6 @@
 """System tray / menu bar client for a running Switchyard server.
 
-Optional extra: pip install 'switchyard[tray]'  (pystray, Pillow, psutil)
+Optional extra: python3 -m pip install -e ".[tray]"  (pystray, Pillow, psutil)
 
   switchyard tray
   python -m switchyard.tray
@@ -80,8 +80,12 @@ def ram_usage() -> dict | None:
     }
 
 
-def confirm(message: str, title: str = "Switchyard") -> bool:
-    """Ask before Clear all when a dialog toolkit is available."""
+def confirm(message: str, title: str = "Switchyard", default: bool = True) -> bool:
+    """Ask with a tkinter dialog. Without one, return `default`.
+
+    Clear all passes default=True (the "Clear all…" click is the confirmation).
+    Installing an update passes default=False: no dialog means no install.
+    """
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -95,7 +99,7 @@ def confirm(message: str, title: str = "Switchyard") -> bool:
         root.destroy()
         return ok
     except Exception:
-        return True  # ponytail: no dialog; the menu click is the confirmation
+        return default
 
 
 @dataclass
@@ -258,7 +262,7 @@ def _require_extra() -> None:
     if missing:
         raise SystemExit(
             "switchyard tray needs the optional extra:\n"
-            "  python3 -m pip install 'switchyard[tray]'\n"
+            "  python3 -m pip install -e \".[tray]\"   (from a checkout; not the PyPI 'switchyard')\n"
             f"missing: {', '.join(missing)}"
         )
 
@@ -396,10 +400,10 @@ class TrayApp:
         prompt = f"Update Switchyard {info.current} → {info.latest}?\n\n{notes[:800]}"
         if info.install != "pip":
             prompt = info.lines() + "\n\nOpen the releases page?"
-            if self.confirm_fn(prompt):
+            if self.confirm_fn(prompt, default=False):
                 self.open_fn(info.url)
             return
-        if not self.confirm_fn(prompt):
+        if not self.confirm_fn(prompt, default=False):
             return
         if self.apply_fn:
             self.apply_fn(info, confirm=True)

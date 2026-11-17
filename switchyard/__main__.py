@@ -14,15 +14,23 @@ from .events import log
 _HELP_EPILOG = """\
 Commands:
   (none)   Start the arbiter, shim, STT and dashboard
-  tray     System tray / menu bar icon (pip install 'switchyard[tray]')
+  ctl      Control a running Switchyard (see `switchyard ctl --help`)
+  tray     System tray / menu bar icon (pip install -e ".[tray]")
   update   Check GitHub for a newer version
 
 Environment:
-  SWITCHYARD_SETTINGS  Settings file (default: /data/settings.json)
-  SWITCHYARD_URL       Dashboard URL for tray (default: http://127.0.0.1:8100)
+  SWITCHYARD_SETTINGS  Path to the settings file (default: /data/settings.json)
+  ARBITER_ENABLED      Enable the GPU arbiter
+  OVMS_SHIM_ENABLED    Enable the OVMS shim
+  STT_ENABLED          Enable speech to text
   DASHBOARD_HOST       Dashboard bind address (default: 127.0.0.1)
+  LISTEN_HOST          Bind address for arbiter, OVMS shim, and STT
+  SWITCHYARD_URL       Dashboard URL for ctl and tray (default: http://127.0.0.1:8100)
 
-The dashboard has no auth; keep it on localhost.
+See the README for the full list.
+
+Warning: the dashboard has no auth and can change settings.
+Keep DASHBOARD_HOST on localhost.
 """
 
 
@@ -36,7 +44,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"switchyard {__version__}")
     sub = parser.add_subparsers(dest="command")
-    tray = sub.add_parser("tray", help="system tray / menu bar (needs pip install 'switchyard[tray]')")
+    # `ctl` is dispatched before parsing (it has its own parser); listed here for --help.
+    sub.add_parser("ctl", help="control a running Switchyard over its dashboard API", add_help=False)
+    tray = sub.add_parser("tray", help="system tray / menu bar (needs the [tray] extra)")
     tray.add_argument("--url", default=None,
                       help="dashboard URL (default: SWITCHYARD_URL or http://127.0.0.1:8100)")
     tray.add_argument("--check-updates", action="store_true",
@@ -70,6 +80,10 @@ def serve() -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "ctl":
+        from .ctl import main as ctl_main
+        raise SystemExit(ctl_main(argv[1:], prog="switchyard ctl"))
     args = _parser().parse_args(argv)
     if args.command == "tray":
         from .tray import run

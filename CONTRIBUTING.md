@@ -44,7 +44,7 @@ Open an issue before large design changes so we can agree on direction.
 ## Pull requests
 
 1. Fork and branch from `main`.
-2. Keep the arbiter / OVMS shim / dashboard stdlib-only unless the change is clearly under an optional extra (`stt` or `tray`). The tray is a separate client of the HTTP API.
+2. Keep the arbiter / OVMS shim / dashboard stdlib-only unless the change is clearly under an optional extra (`stt`, `nvml` or `tray`). The tray is a separate client of the HTTP API.
 3. Add or update tests for behavior changes.
 4. Run the test suite locally.
 5. Fill in the pull request template.

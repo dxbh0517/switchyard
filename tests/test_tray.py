@@ -140,6 +140,16 @@ class TrayAppTests(unittest.TestCase):
         client.give_gpu.assert_called_with("vision", STATUS)
         client.set_shared.assert_called_with(True)
 
+    def test_update_needs_a_real_yes_without_dialog(self):
+        from switchyard.update import UpdateInfo
+        info = UpdateInfo(current="0.1.0", latest="0.2.0", tag="v0.2.0", available=True, install="pip")
+        applied = []
+        # confirm_fn mirrors confirm(): with no dialog it returns `default`.
+        app, _ = self._app(confirm_fn=lambda msg, title="Switchyard", default=True: default,
+                           check_fn=lambda: info, apply_fn=lambda i, confirm: applied.append(i))
+        app._do_update()
+        self.assertEqual(applied, [], "no dialog must not mean 'install'")
+
     def test_clear_aborts_when_confirm_false(self):
         app, client = self._app(confirm_fn=lambda *a, **k: False)
         app.dispatch("clear")

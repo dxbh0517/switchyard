@@ -77,6 +77,20 @@ class DetectTests(unittest.TestCase):
         self.assertEqual(detect_install({"SWITCHYARD_INSTALL": "pip"}), "pip")
         self.assertEqual(detect_install({"SWITCHYARD_INSTALL": "docker"}), "docker")
 
+    def test_editable_install_is_source(self):
+        from switchyard.update import _is_editable
+
+        class Dist:
+            def __init__(self, raw):
+                self.raw = raw
+
+            def read_text(self, name):
+                return self.raw if name == "direct_url.json" else None
+
+        self.assertTrue(_is_editable(Dist('{"url": "file:///x", "dir_info": {"editable": true}}')))
+        self.assertFalse(_is_editable(Dist('{"url": "https://x", "vcs_info": {"vcs": "git"}}')))
+        self.assertFalse(_is_editable(Dist(None)))
+
     def test_dockerenv_file(self):
         import tempfile
         with tempfile.NamedTemporaryFile() as f:
@@ -84,18 +98,17 @@ class DetectTests(unittest.TestCase):
 
 
 class CheckTests(unittest.TestCase):
-    def test_release_newer_and_pypi(self):
+    def test_release_newer_installs_from_git_tag(self):
         o = gh({
             "/repos/dxbh0517/switchyard/releases/latest": (
                 200, {"tag_name": "v0.9.0", "body": "fixed the GPU", "html_url": "https://example/r"}),
-            "/pypi/switchyard/json": (200, {"releases": {"0.9.0": [{}]}, "info": {"version": "0.9.0"}}),
         })
         info = check(current="0.1.0", opener=o, install="pip")
         self.assertTrue(info.available)
         self.assertEqual(info.latest, "0.9.0")
         self.assertIn("fixed the GPU", info.notes)
-        self.assertTrue(info.via_pypi)
-        self.assertEqual(pip_spec(info), "switchyard==0.9.0")
+        # Never PyPI: that name belongs to an unrelated project.
+        self.assertEqual(pip_spec(info), "git+https://github.com/dxbh0517/switchyard.git@v0.9.0")
 
     def test_no_releases_uses_tags(self):
         o = gh({
@@ -103,13 +116,11 @@ class CheckTests(unittest.TestCase):
             "/repos/dxbh0517/switchyard/tags": (200, [
                 {"name": "v0.0.1"}, {"name": "v0.2.0"}, {"name": "not-a-version"},
             ]),
-            "/pypi/switchyard/json": (404, {}),
         })
         info = check(current="0.1.0", opener=o, install="pip")
         self.assertTrue(info.available)
         self.assertEqual(info.latest, "0.2.0")
         self.assertIn("No release notes", info.notes)
-        self.assertFalse(info.via_pypi)
         self.assertIn("@v0.2.0", pip_spec(info))
 
     def test_no_releases_or_tags(self):
@@ -151,7 +162,6 @@ class CheckTests(unittest.TestCase):
         o = gh({
             "/repos/dxbh0517/switchyard/releases/latest": (
                 200, {"tag_name": "v9.0.0", "body": "big"}),
-            "/pypi/switchyard/json": (404, {}),
         })
         info = check(current="0.1.0", opener=o, install="docker")
         self.assertTrue(info.available)
@@ -161,7 +171,7 @@ class CheckTests(unittest.TestCase):
 class ApplyTests(unittest.TestCase):
     def test_pip_install_only_after_confirm(self):
         info = UpdateInfo(current="0.1.0", latest="0.2.0", tag="v0.2.0",
-                          available=True, install="pip", via_pypi=True)
+                          available=True, install="pip")
         ran = []
 
         def fake_run(cmd, check=False):
@@ -175,7 +185,7 @@ class ApplyTests(unittest.TestCase):
             self.assertEqual(apply(info, confirm=True, run=fake_run), 0)
         self.assertEqual(ran[0][1:4], ["-m", "pip", "install"])
         self.assertIn("--upgrade", ran[0])
-        self.assertIn("switchyard==0.2.0", ran[0])
+        self.assertIn("git+https://github.com/dxbh0517/switchyard.git@v0.2.0", ran[0])
 
     def test_docker_never_runs_pip(self):
         info = UpdateInfo(current="0.1.0", latest="0.2.0", tag="v0.2.0",
@@ -189,7 +199,6 @@ class ApplyTests(unittest.TestCase):
         o = gh({
             "/repos/dxbh0517/switchyard/releases/latest": (
                 200, {"tag_name": "v9.9.9", "body": "notes here"}),
-            "/pypi/switchyard/json": (404, {}),
         })
         ran = []
         info = check(current="0.1.0", opener=o, install="pip")

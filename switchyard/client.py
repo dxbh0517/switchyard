@@ -1,8 +1,8 @@
 """HTTP client for a running Switchyard dashboard (or engine port). Stdlib only.
 
 Talks to GET /api/status, GET /api/settings, POST /api/action, POST /api/settings.
-Falls back to GET /gpu/status and POST /gpu/acquire when the dashboard is absent
-or an older server lacks a field. Missing keys are treated as unknown, never as errors.
+Falls back to GET /gpu/status when the dashboard is absent or an older server
+lacks a field. Missing keys are treated as unknown, never as errors.
 """
 from __future__ import annotations
 
@@ -10,13 +10,11 @@ import json
 import os
 import urllib.error
 import urllib.request
-from urllib.parse import urlparse
 
 from . import __version__
 
 DEFAULT_TIMEOUT = 8
 ACTION_TIMEOUT = 30
-ACQUIRE_TIMEOUT = 120
 
 
 class ApiError(Exception):
@@ -142,8 +140,10 @@ def fmt_mib(used: int | None, total: int | None) -> str:
 
 
 class Client:
-    def __init__(self, base: str | None = None, opener=None):
+    def __init__(self, base: str | None = None, opener=None, token: str | None = None):
         self.base = (base or default_url()).rstrip("/")
+        tok = token if token is not None else os.environ.get("SWITCHYARD_TOKEN")
+        self.token = (tok or "").strip() or None
         self._opener = opener  # tests inject a fake urlopen
 
     def request(self, method: str, path_or_url: str, body=None, timeout: float = DEFAULT_TIMEOUT):
@@ -151,7 +151,10 @@ class Client:
         headers = {
             "User-Agent": f"switchyard/{__version__}",
             "Accept": "application/json",
+            "X-Switchyard": "tray",  # non-browser client marker for the dashboard's CSRF check
         }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
         data = None
         if body is not None:
             data = json.dumps(body).encode()
@@ -216,12 +219,7 @@ class Client:
         return data if isinstance(data, dict) else {}
 
     def set_shared(self, enabled: bool) -> dict:
-        try:
-            return self.update_settings({"shared_vram": bool(enabled)})
-        except ApiError as e:
-            if e.status == 400 or "unknown" in str(e).lower():
-                return self.update_settings({"SHARED_VRAM": bool(enabled)})
-            raise
+        return self.update_settings({"shared_vram": bool(enabled)})
 
     def give_gpu(self, name: str, status: dict | None = None) -> dict:
         if name == "comfy":
@@ -229,23 +227,24 @@ class Client:
         return self.action("arbiter", "warm", name)
 
     def give_comfy(self, status: dict | None = None) -> dict:
-        try:
-            return self.action("arbiter", "comfy_acquire")
-        except ApiError as e:
-            if e.status in (400, 404) or "unknown" in str(e).lower():
-                return self.acquire_via_engine(status)
-            raise
+        """Free the GPU for ComfyUI by sleeping every awake engine.
 
-    def acquire_via_engine(self, status: dict | None) -> dict:
-        scheme, host = _host_of(self.base)
-        for eng in engines_map(status).values():
-            port = _num(eng.get("listen"))
-            if not port:
+        ComfyUI loads its models on its next prompt, and its own gpu_arbiter node
+        takes the claim then. POST /gpu/acquire is not used here: it opens a claim
+        that only /gpu/release closes, so every engine request would block until
+        the arbiter's stale-claim timeout.
+        """
+        errors = []
+        for name, eng in engines_map(status).items():
+            if eng.get("state") in ("asleep", "disabled", "down"):
                 continue
-            url = f"{scheme}://{host}:{port}/gpu/acquire"
-            data = self.request("POST", url, {}, timeout=ACQUIRE_TIMEOUT)[1]
-            return data if isinstance(data, dict) else {"owner": "comfy"}
-        raise ApiError("no engine listen port to POST /gpu/acquire")
+            try:
+                self.action("arbiter", "sleep", name)
+            except ApiError as e:
+                errors.append(f"{name}: {e}")
+        if errors:
+            raise ApiError("; ".join(errors))
+        return {"result": "started"}
 
     def clear_all(self, status: dict | None = None) -> list[str]:
         """Sleep every engine and unload ComfyUI. Continues past individual failures."""
@@ -260,11 +259,3 @@ class Client:
         except ApiError as e:
             errors.append(f"comfy: {e}")
         return errors
-
-
-def _host_of(base: str) -> tuple[str, str]:
-    u = urlparse(base)
-    host = u.hostname or "127.0.0.1"
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    return u.scheme or "http", host

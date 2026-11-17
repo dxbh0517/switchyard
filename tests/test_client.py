@@ -175,30 +175,24 @@ class ClientTests(unittest.TestCase):
         c.set_shared(True)
         self.assertEqual(o.calls[1]["body"], {"shared_vram": True})
 
-    def test_set_shared_falls_back_to_env_style_key(self):
-        calls = {"n": 0}
+    def test_give_comfy_sleeps_awake_engines_without_a_claim(self):
+        o = opener({("POST", "/api/action"): (200, {"result": "started"})})
+        Client("http://192.168.1.5:8100", opener=o).give_gpu("comfy", DASH)
+        self.assertFalse([x for x in o.calls if x["path"] == "/gpu/acquire"],
+                         "an acquire without a release would block every engine")
+        actions = [(x["body"]["action"], x["body"].get("target")) for x in o.calls]
+        self.assertEqual(actions, [("sleep", "qwen")])  # vision is already asleep
+
+    def test_auth_headers(self):
+        seen = []
 
         def open_url(req, timeout=None):
-            calls["n"] += 1
-            body = json.loads(req.data)
-            if "shared_vram" in body:
-                raise urllib.error.HTTPError(req.full_url, 400, "err", _headers(),
-                                             io.BytesIO(b'{"error":"unknown setting shared_vram"}'))
-            return FakeResp({"changed": ["SHARED_VRAM"]})
+            seen.append(dict(req.header_items()))
+            return FakeResp(DASH)
 
-        c = Client("http://127.0.0.1:8100", opener=open_url)
-        self.assertEqual(c.set_shared(False)["changed"], ["SHARED_VRAM"])
-
-    def test_give_comfy_falls_back_to_engine_acquire(self):
-        o = opener({
-            ("POST", "/api/action"): (400, {"error": "unknown action comfy_acquire"}),
-            ("POST", "/gpu/acquire"): (200, {"owner": "comfy"}),
-        })
-        c = Client("http://192.168.1.5:8100", opener=o)
-        r = c.give_gpu("comfy", DASH)
-        self.assertEqual(r["owner"], "comfy")
-        acquire = [x for x in o.calls if x["path"] == "/gpu/acquire"][0]
-        self.assertEqual(acquire["url"], "http://192.168.1.5:8000/gpu/acquire")
+        Client("http://127.0.0.1:8100", opener=open_url, token="s3cret").status()
+        self.assertEqual(seen[0].get("Authorization"), "Bearer s3cret")
+        self.assertTrue(seen[0].get("X-switchyard"))
 
     def test_give_engine_warms(self):
         o = opener({("POST", "/api/action"): (200, {"result": "started"})})

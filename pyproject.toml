@@ -40,6 +40,7 @@ stt = [
   "transformers>=5.16.0",
   "numpy",
 ]
+nvml = ["nvidia-ml-py"]
 tray = [
   "pystray>=0.19",
   "pillow>=10",
@@ -55,6 +56,7 @@ Changelog = "https://github.com/dxbh0517/switchyard/releases"
 
 [project.scripts]
 switchyard = "switchyard.__main__:main"
+switchyardctl = "switchyard.ctl:main"
 
 [project.gui-scripts]
 switchyard-tray = "switchyard.tray:main"

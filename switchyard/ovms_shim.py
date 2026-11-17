@@ -208,8 +208,8 @@ class OvmsShim:
         return OvmsHandler
 
     def start(self) -> None:
-        port = self.s.get("ovms_port")
-        log(C, f":{port} -> {self.s.get('ovms_upstream')} (rerank model {self.s.get('rerank_model')})")
+        host, port = self.s.get("listen_host"), self.s.get("ovms_port")
+        log(C, f"{host}:{port} -> {self.s.get('ovms_upstream')} (rerank model {self.s.get('rerank_model')})")
         threading.Thread(target=self.poller, daemon=True).start()
-        srv = Server(("0.0.0.0", port), self.make_handler())
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.server = Server((host, port), self.make_handler())
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
