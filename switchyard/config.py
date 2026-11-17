@@ -44,13 +44,28 @@ FIELDS: list[Field] = [
                "restart; the free-VRAM target applies live."),
     Field("text_only_engines", "arbiter", "Text-only engines", "str", "qwen", "TEXT_ONLY_ENGINES",
           help="Comma-separated. Image parts sent to these engines are replaced with a note."),
-    Field("comfy_url", "arbiter", "ComfyUI URL", "str", "http://127.0.0.1:8188", "COMFY_URL"),
+    Field("comfy_url", "arbiter", "ComfyUI URL", "str", "http://127.0.0.1:8188", "COMFY_URL",
+          help="Queue, model unload, and last-resort VRAM probe via /system_stats."),
+    Field("gpu_probe", "arbiter", "VRAM probe", "choice", "auto", "GPU_PROBE",
+          choices=("auto", "nvml", "nvidia-smi", "comfy", "off"),
+          help="auto tries NVML, then nvidia-smi, then ComfyUI. off disables probing."),
+    Field("gpu_index", "arbiter", "GPU index", "int", 0, "GPU_INDEX", min=0,
+          help="Which NVIDIA GPU to read. Single-card hosts leave this at 0."),
     Field("listen_host", "arbiter", "Listen host", "str", "0.0.0.0", "LISTEN_HOST", live=False),
     Field("idle_sleep_sec", "arbiter", "Sleep after idle (s)", "int", 120, "IDLE_SLEEP_SEC", min=10,
           help="An awake engine with no traffic for this long goes back to sleep."),
     Field("sleep_level", "arbiter", "Sleep level", "choice", 2, "SLEEP_LEVEL", choices=(1, 2),
           help="1 keeps weights in CPU RAM (fast wake, uses RAM). 2 drops them (reload from disk)."),
-    Field("wake_attempts", "arbiter", "Wake attempts", "int", 3, "WAKE_ATTEMPTS", min=1, max=10),
+    Field("wake_attempts", "arbiter", "Wake attempts", "int", 3, "WAKE_ATTEMPTS", min=1, max=10,
+          help="How many times to try waking an engine before marking it unhealthy and returning HTTP 503."),
+    Field("wake_backoff_sec", "arbiter", "Wake retry backoff (s)", "float", 1.0, "WAKE_BACKOFF_SEC", min=0,
+          help="Initial delay between wake attempts; doubles after each failure (1s, 2s, 4s, …)."),
+    Field("health_interval_sec", "arbiter", "Health check interval (s)", "float", 15.0,
+          "HEALTH_INTERVAL_SEC", min=0.1,
+          help="How often to probe vLLM /health and ComfyUI /system_stats. Probes do not hold the arbiter lock."),
+    Field("health_timeout_sec", "arbiter", "Health check timeout (s)", "float", 5.0,
+          "HEALTH_TIMEOUT_SEC", min=0.05,
+          help="HTTP timeout for each health probe. Also used to verify the engine after a wake."),
     Field("comfy_free_wait_sec", "arbiter", "Wait for ComfyUI unload (s)", "float", 30.0,
           "COMFY_FREE_WAIT_SEC", min=0),
     Field("loading_max_sec", "arbiter", "Engine startup claim (s)", "int", 900, "LOADING_MAX_SEC", min=60,
@@ -73,8 +88,12 @@ FIELDS: list[Field] = [
           help="Long audio is cut at the quietest point near each boundary."),
     # Dashboard -----------------------------------------------------------------
     Field("dashboard_host", "dashboard", "Listen host", "str", "127.0.0.1", "DASHBOARD_HOST", live=False,
-          help="The dashboard can change settings and has no login; keep it on localhost."),
+          help="127.0.0.1 keeps the dashboard local. 0.0.0.0 exposes it; set SWITCHYARD_TOKEN if you do."),
     Field("dashboard_port", "dashboard", "Listen port", "int", 8100, "DASHBOARD_PORT", live=False),
+    Field("dashboard_token", "dashboard", "API token", "str", "", "SWITCHYARD_TOKEN",
+          help="When set, every dashboard API call needs Authorization: Bearer <token>. "
+               "Required if the dashboard is reachable from other machines. Write-only: "
+               "the current value is never shown here."),
 ]
 BY_KEY = {f.key: f for f in FIELDS}
 
@@ -109,7 +128,8 @@ def _coerce(f: Field, value):
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
-    if f.type in ("int", "choice"):
+    numeric_choice = f.type == "choice" and f.choices and isinstance(next(iter(f.choices)), int)
+    if f.type == "int" or numeric_choice:
         value = int(value)
     elif f.type == "float":
         value = float(value)
@@ -182,10 +202,7 @@ class Settings:
             old = {k: self._values[k] for k in clean}
             self._values.update(clean)
             self.saved.update(clean)
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.saved, indent=2))
-            tmp.replace(self.path)
+            self._persist()
         changed = {k: v for k, v in clean.items() if old[k] != v}
         for fn in self._listeners:
             try:
@@ -194,9 +211,16 @@ class Settings:
                 pass
         return {"changed": sorted(changed), "restart_pending": self.restart_pending()}
 
+    def _persist(self) -> None:
+        """Write saved values: create the parent dir and replace via a temp file."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.saved, indent=2))
+        tmp.replace(self.path)
+
     def reset(self, key: str) -> dict:
         """Forget a saved override (falls back to env/default after restart)."""
         with self._lock:
             self.saved.pop(key, None)
-            self.path.write_text(json.dumps(self.saved, indent=2))
+            self._persist()
         return {"reset": key}

@@ -212,6 +212,24 @@ class AnalyticsTests(unittest.TestCase):
             self.assertIsNone(used)
 
 
+class HealthAnalyticsTests(unittest.TestCase):
+    def test_health_checks_recorded_on_transition_only(self):
+        from switchyard.arbiter import Arbiter
+        with tempfile.TemporaryDirectory() as d:
+            s = config.Settings(os.path.join(d, "s.json"))
+            s.update({"engines": "a=127.0.0.1:9@8:1000"})
+            analytics.configure(s, path=os.path.join(d, "analytics.sqlite"))
+            try:
+                arb = Arbiter(s)
+                for status in ("healthy", "healthy", "healthy", "unreachable", "unreachable", "healthy"):
+                    arb._record_health(arb.health["a"], "a", status, None if status == "healthy" else "x")
+                analytics.get().flush()
+                rows = analytics.history(kind="health_check")["events"]
+            finally:
+                analytics.reset()
+        self.assertEqual([r["details"]["to"] for r in reversed(rows)], ["healthy", "unreachable", "healthy"])
+
+
 class HistoryEndpointDisabledTests(unittest.TestCase):
     def test_disabled_endpoint_is_empty(self):
         saved = os.environ.get("SWITCHYARD_ANALYTICS")
