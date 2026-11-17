@@ -176,8 +176,8 @@ class Stt:
         return SttHandler
 
     def start(self) -> None:
-        port = self.s.get("stt_port")
-        log(C, f"listening on :{port}")
+        host, port = self.s.get("listen_host"), self.s.get("stt_port")
+        log(C, f"listening on {host}:{port}")
         self.reload()
-        srv = Server(("0.0.0.0", port), self.make_handler())
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.server = Server((host, port), self.make_handler())
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()

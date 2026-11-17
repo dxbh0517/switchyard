@@ -4,6 +4,9 @@ The arbiter tests run against fake vLLM engines and a fake ComfyUI on localhost.
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import json
 import os
 import socket
@@ -14,11 +17,11 @@ import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
-from switchyard import config
+from switchyard import __version__, config, events
 from switchyard.arbiter import Arbiter, strip_images
 from switchyard.httputil import Server
 from switchyard.ovms_shim import OvmsShim, StreamThinkFilter, split_think
-from switchyard.stt import parse_multipart
+from switchyard.stt import Stt, parse_multipart
 
 
 def free_port() -> int:
@@ -144,6 +147,27 @@ class ConfigTests(unittest.TestCase):
                 s.update({"engines": [{"name": "a", "backend": "nohostport", "listen": 1}]})
             with self.assertRaises(ValueError):
                 s.update({"nope": 1})
+            s.update({"gpu_probe": "nvidia-smi", "gpu_index": 1})
+            self.assertEqual(s.get("gpu_probe"), "nvidia-smi")
+            self.assertEqual(s.get("gpu_index"), 1)
+            with self.assertRaises(ValueError):
+                s.update({"gpu_probe": "cuda"})
+
+    def test_reset_creates_parent_and_drops_saved_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "nested", "s.json")
+            s = config.Settings(path)
+            s.update({"idle_sleep_sec": 45, "stt_port": 9999})
+            os.remove(path)
+            os.rmdir(os.path.dirname(path))
+            r = s.reset("idle_sleep_sec")
+            self.assertEqual(r, {"reset": "idle_sleep_sec"})
+            self.assertTrue(os.path.isfile(path))
+            self.assertFalse(os.path.exists(os.path.join(d, "nested", "s.tmp")))
+            with open(path) as f:
+                saved = json.loads(f.read())
+            self.assertNotIn("idle_sleep_sec", saved)
+            self.assertEqual(saved["stt_port"], 9999)
 
     def test_health_defaults(self):
         with tempfile.TemporaryDirectory() as d:
@@ -209,7 +233,8 @@ class ArbiterTests(unittest.TestCase):
         self.la, self.lb = free_port(), free_port()
         s = config.Settings(os.path.join(self.tmp.name, "s.json"))
         s.update({"engines": f"a=127.0.0.1:{pa}@{self.la}:1000,b=127.0.0.1:{pb}@{self.lb}:1000",
-                  "text_only_engines": "a", "comfy_url": f"http://127.0.0.1:{pc}", "listen_host": "127.0.0.1"})
+                  "text_only_engines": "a", "comfy_url": f"http://127.0.0.1:{pc}", "listen_host": "127.0.0.1",
+                  "gpu_probe": "comfy"})
         self.arb = Arbiter(s)
         self.arb.start()
         time.sleep(0.3)
@@ -233,6 +258,10 @@ class ArbiterTests(unittest.TestCase):
         st = get(f"http://127.0.0.1:{self.la}/gpu/status")
         self.assertEqual(st["owner"], "b")
         self.assertEqual(st["engines"]["a"]["requests"], 1)
+        self.assertEqual(st["gpu"]["source"], "comfy")
+        self.assertEqual(st["gpu"]["free_mb"], round(30 * 2**30 / 2**20))
+        self.assertEqual(st["gpu"]["used_mb"], st["gpu"]["total_mb"] - st["gpu"]["free_mb"])
+        self.assertEqual(st["gpu"]["name"], "Fake GPU")
 
     def test_comfy_acquire_sleeps_engines(self):
         self.chat(self.la)
@@ -246,6 +275,17 @@ class ArbiterTests(unittest.TestCase):
     def test_text_only_strips_images(self):
         self.chat(self.la, [{"type": "image_url", "image_url": {"url": "data:x"}}])
         self.assertEqual(self.a_state["last_body"]["messages"][0]["content"][0]["type"], "text")
+
+    def test_wake_warns_when_vram_unknown(self):
+        self.arb.s.update({"gpu_probe": "off"})
+        self.arb.probe._cached = None
+        before = max((e["id"] for e in events.since(0)), default=0)
+        self.chat(self.la)
+        msgs = [e["msg"] for e in events.since(before)]
+        self.assertTrue(any("VRAM unknown" in m for m in msgs))
+        st = get(f"http://127.0.0.1:{self.la}/gpu/status")
+        self.assertEqual(st["gpu"]["source"], "off")
+        self.assertIsNone(st["gpu"]["free_mb"])
 
 
 class OvmsShimTests(unittest.TestCase):
@@ -274,7 +314,8 @@ class OvmsShimTests(unittest.TestCase):
             up, port = serve(H)
             s = config.Settings(os.path.join(d, "s.json"))
             shim_port = free_port()
-            s.update({"ovms_upstream": f"http://127.0.0.1:{port}", "ovms_port": shim_port})
+            s.update({"ovms_upstream": f"http://127.0.0.1:{port}", "ovms_port": shim_port,
+                      "listen_host": "127.0.0.1"})
             shim = OvmsShim(s)
             shim.start()
             time.sleep(0.2)
@@ -285,8 +326,71 @@ class OvmsShimTests(unittest.TestCase):
                      {"query": "q", "documents": ["d"], "return_documents": True})
             self.assertEqual(r["results"][0]["document"]["text"], "d")
             self.assertIn("<Document>: d", seen["/v3/rerank"]["documents"][0])
+            shim.server.shutdown()
+            shim.server.server_close()
             up.shutdown()
             up.server_close()
+
+    def test_honors_listen_host(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = config.Settings(os.path.join(d, "s.json"))
+            port = free_port()
+            s.update({"listen_host": "127.0.0.1", "ovms_port": port})
+            shim = OvmsShim(s)
+            shim.start()
+            try:
+                self.assertEqual(shim.server.server_address[0], "127.0.0.1")
+                self.assertEqual(shim.server.server_address[1], port)
+            finally:
+                shim.server.shutdown()
+                shim.server.server_close()
+
+
+class SttBindTests(unittest.TestCase):
+    def test_honors_listen_host(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = config.Settings(os.path.join(d, "s.json"))
+            port = free_port()
+            s.update({"listen_host": "127.0.0.1", "stt_port": port, "stt_model_path": os.path.join(d, "no-model")})
+            stt = Stt(s)
+            stt.reload = lambda: None
+            stt.start()
+            try:
+                self.assertEqual(stt.server.server_address[0], "127.0.0.1")
+                self.assertEqual(stt.server.server_address[1], port)
+            finally:
+                stt.server.shutdown()
+                stt.server.server_close()
+
+
+class CliTests(unittest.TestCase):
+    def test_help_lists_settings_and_dashboard_warning(self):
+        from switchyard.__main__ import main
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            main(["--help"])
+        self.assertEqual(cm.exception.code, 0)
+        out = buf.getvalue()
+        self.assertIn("SWITCHYARD_SETTINGS", out)
+        self.assertIn("ARBITER_ENABLED", out)
+        self.assertIn("STT_ENABLED", out)
+        self.assertIn("DASHBOARD_HOST", out)
+        self.assertIn("no auth", out)
+        self.assertIn("localhost", out)
+        self.assertIn(__version__, out)
+
+    def test_version(self):
+        from switchyard.__main__ import main
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            main(["--version"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn(__version__, buf.getvalue())
+
+    def test_no_args_does_not_exit(self):
+        from switchyard.__main__ import _parser
+        ns = _parser().parse_args([])
+        self.assertIsNone(ns.command)
 
 
 if __name__ == "__main__":
