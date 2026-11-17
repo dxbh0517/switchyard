@@ -102,7 +102,8 @@ class Arbiter:
     def __init__(self, settings: Settings):
         self.s = settings
         # Backends and listen ports are fixed for the life of the process.
-        self.engines = {e["name"]: dict(e) for e in settings.get("engines")}
+        # Disabled engines are omitted: no listen port, no wake/sleep.
+        self.engines = {e["name"]: dict(e) for e in settings.get("engines") if e.get("enabled", True)}
         for e in self.engines.values():
             host, _, port = e["backend"].rpartition(":")
             e["host"], e["port"] = host, int(port)
@@ -146,6 +147,14 @@ class Arbiter:
 
     def text_only(self, engine: str) -> bool:
         return engine in {x.strip() for x in self.s.get("text_only_engines").split(",")}
+
+    def is_enabled(self, engine: str) -> bool:
+        live = self.s.engine(engine)
+        return bool(live and live.get("enabled", True))
+
+    def wants_boot(self, engine: str) -> bool:
+        live = self.s.engine(engine)
+        return bool(live and live.get("enabled", True) and live.get("boot"))
 
     def comfy_url(self) -> str:
         return self.s.get("comfy_url").rstrip("/")
@@ -406,6 +415,10 @@ class Arbiter:
 
     # ------------------------------------------------------------ ownership
     def engine_enter(self, engine: str) -> None:
+        if engine not in self.engines:
+            raise RuntimeError(f"unknown engine {engine}")
+        if not self.is_enabled(engine):
+            raise RuntimeError(f"{engine} is disabled")
         st = self.state
         self._raise_if_unavailable(engine)
         with self.cond:
@@ -527,6 +540,8 @@ class Arbiter:
     def action(self, name: str, target: str | None) -> str:
         if name in ("sleep", "warm") and target not in self.engines:
             raise ValueError(f"unknown engine {target}")
+        if name == "warm" and not self.is_enabled(target):
+            raise ValueError(f"{target} is disabled")
         if name == "sleep":
             def run():
                 with self.cond:
@@ -582,7 +597,18 @@ class Arbiter:
         st, now = self.state, time.time()
         engines = {}
         resident = []
-        for e, cfg in self.engines.items():
+        for live in self.s.get("engines"):
+            e = live["name"]
+            enabled, boot = bool(live.get("enabled", True)), bool(live.get("boot"))
+            if e not in self.engines:
+                engines[e] = {
+                    "listen": live["listen"], "backend": live["backend"],
+                    "free_mb": int(live.get("free_mb") or 0), "text_only": self.text_only(e),
+                    "state": "disabled" if not enabled else "down",
+                    "enabled": enabled, "boot": boot, "inflight": 0, "idle_sec": 0,
+                }
+                continue
+            cfg = self.engines[e]
             loading = now < st["loading_until"][e]
             s = self.sleeping[e]
             cost, src = self.cost_of(e)
@@ -590,7 +616,7 @@ class Arbiter:
                 resident.append(e)
             engines[e] = {
                 "listen": cfg["listen"], "backend": cfg["backend"], "free_mb": self.free_mb(e),
-                "text_only": self.text_only(e),
+                "text_only": self.text_only(e), "enabled": enabled, "boot": boot,
                 "state": "loading" if loading else {True: "asleep", False: "awake", None: "down"}[s],
                 "inflight": st["inflight"][e],
                 "idle_sec": round(now - st["last_infer"][e]),
@@ -661,28 +687,45 @@ class Arbiter:
                         self._release_owner(e)
                     self._end_switch(to_sleep[0])
 
+    def on_backend_ready(self, engine: str) -> None:
+        """Park a newly-up engine, or wake it if it is marked to load on boot."""
+        with self.cond:
+            self.state["loading_until"][engine] = 0.0
+            busy = self.state["owner"] == engine or self.state["inflight"][engine]
+            boot = self.wants_boot(engine)
+            self.cond.notify_all()
+        if busy:
+            return
+        if boot:
+            try:
+                self.engine_enter(engine)
+                self.engine_exit(engine)
+                log(C, f"{engine} loaded on boot")
+            except Exception as e:
+                log(C, f"boot load {engine} failed: {e}", "error")
+            return
+        should_sleep = False
+        with self.cond:
+            if (self.state["owner"] != engine and self.state["inflight"][engine] == 0
+                    and not self.state["switching"] and self.sleeping[engine] is False):
+                should_sleep = True
+                self._begin_switch(engine, [engine])
+        if should_sleep:
+            try:
+                self.sleep(engine, "startup")
+            except Exception as e:
+                log(C, f"startup sleep {engine} failed: {e}", "error")
+            finally:
+                with self.cond:
+                    self._end_switch(engine)
+
     def startup_watcher(self, engine: str) -> None:
-        """Once an engine is up, put it to sleep so the GPU is free; repeat after restarts."""
+        """Once an engine is up, park it (or boot-load it); repeat after restarts."""
         while True:
             while self.is_sleeping(engine) is None:
                 time.sleep(5)
             log(C, f"{engine} backend ready")
-            should_sleep = False
-            with self.cond:
-                self.state["loading_until"][engine] = 0.0
-                if (self.state["owner"] != engine and self.state["inflight"][engine] == 0
-                        and not self.state["switching"] and self.sleeping[engine] is False):
-                    should_sleep = True
-                    self._begin_switch(engine, [engine])
-                self.cond.notify_all()
-            if should_sleep:
-                try:
-                    self.sleep(engine, "startup")
-                except Exception as e:
-                    log(C, f"startup sleep {engine} failed: {e}", "error")
-                finally:
-                    with self.cond:
-                        self._end_switch(engine)
+            self.on_backend_ready(engine)
             # /is_sleeping can time out during a level-2 wake, so require several misses.
             misses = 0
             while misses < 4:
@@ -803,9 +846,12 @@ class Arbiter:
     def start(self) -> None:
         host = self.s.get("listen_host")
         mode = "shared" if self.shared() else "exclusive"
+        if not self.engines:
+            log(C, "no enabled engines; GPU API listen ports are not bound", "warn")
         for e, cfg in self.engines.items():
+            boot = "boot" if cfg.get("boot") else "parked"
             log(C, f"{e}: {host}:{cfg['listen']} -> {cfg['backend']} "
-                   f"(wake needs {cfg['free_mb']} MiB free, {mode})")
+                   f"(wake needs {cfg['free_mb']} MiB free, {mode}, {boot})")
         for target in (self.idle_watcher, self.poller, self.health_monitor):
             threading.Thread(target=target, daemon=True).start()
         for e, cfg in self.engines.items():

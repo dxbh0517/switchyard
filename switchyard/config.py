@@ -28,6 +28,7 @@ class Field:
     choices: tuple = ()
     min: float | None = None
     max: float | None = None
+    section: str = ""    # optional heading inside a group; unknown sections just render their key
 
 
 GROUPS = {
@@ -37,51 +38,76 @@ GROUPS = {
     "dashboard": "Dashboard",
 }
 
+# Headings inside a settings group.
+SECTIONS = {
+    "engines": "Engines",
+    "switching": "Switching & swapping",
+    "health": "Health checks",
+    "vram": "VRAM probe",
+    "budget": "Shared VRAM budget",
+}
+
 FIELDS: list[Field] = [
     # GPU arbiter ---------------------------------------------------------------
     Field("arbiter_enabled", "arbiter", "Enabled", "bool", True, "ARBITER_ENABLED", live=False),
+    Field("listen_host", "arbiter", "Listen host", "str", "0.0.0.0", "LISTEN_HOST", live=False),
     Field("engines", "arbiter", "Engines", "engines",
           "qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500", "ENGINES", live=False,
-          help="vLLM engines sharing the GPU. name=host:port@listen:free_mb[:vram_mb]. "
-               "Name, backend and listen port changes need a restart; free_mb and vram_mb apply live."),
+          help="name=host:port@listen:free_mb[:vram_mb][:boot|:off]. On/off, boot, name, backend "
+               "and listen need a restart; free MiB and VRAM cost apply live. At most one On engine "
+               "may load on boot.",
+          section="engines"),
     Field("text_only_engines", "arbiter", "Text-only engines", "str", "qwen", "TEXT_ONLY_ENGINES",
-          help="Comma-separated. Image parts sent to these engines are replaced with a note."),
-    Field("comfy_url", "arbiter", "ComfyUI URL", "str", "http://127.0.0.1:8188", "COMFY_URL",
-          help="Queue, model unload, and last-resort VRAM probe via /system_stats."),
-    Field("gpu_probe", "arbiter", "VRAM probe", "choice", "auto", "GPU_PROBE",
-          choices=("auto", "nvml", "nvidia-smi", "comfy", "off"),
-          help="auto tries NVML, then nvidia-smi, then ComfyUI. off disables probing."),
-    Field("gpu_index", "arbiter", "GPU index", "int", 0, "GPU_INDEX", min=0,
-          help="Which NVIDIA GPU to read. Single-card hosts leave this at 0."),
-    Field("listen_host", "arbiter", "Listen host", "str", "0.0.0.0", "LISTEN_HOST", live=False),
+          help="Comma-separated. Image parts sent to these engines are replaced with a note.",
+          section="engines"),
     Field("idle_sleep_sec", "arbiter", "Sleep after idle (s)", "int", 120, "IDLE_SLEEP_SEC", min=10,
-          help="An awake engine with no traffic for this long goes back to sleep."),
+          help="An awake engine with no traffic for this long goes back to sleep.",
+          section="switching"),
     Field("sleep_level", "arbiter", "Sleep level", "choice", 2, "SLEEP_LEVEL", choices=(1, 2),
-          help="1 keeps weights in CPU RAM (fast wake, uses RAM). 2 drops them (reload from disk)."),
+          help="1 keeps weights in CPU RAM (fast wake, uses RAM). 2 drops them (reload from disk).",
+          section="switching"),
     Field("wake_attempts", "arbiter", "Wake attempts", "int", 3, "WAKE_ATTEMPTS", min=1, max=10,
-          help="How many times to try waking an engine before marking it unhealthy and returning HTTP 503."),
+          help="How many times to try waking an engine before marking it unhealthy and returning HTTP 503.",
+          section="switching"),
     Field("wake_backoff_sec", "arbiter", "Wake retry backoff (s)", "float", 1.0, "WAKE_BACKOFF_SEC", min=0,
-          help="Initial delay between wake attempts; doubles after each failure (1s, 2s, 4s, …)."),
+          help="Initial delay between wake attempts; doubles after each failure (1s, 2s, 4s, …).",
+          section="switching"),
+    Field("comfy_free_wait_sec", "arbiter", "Wait for ComfyUI unload (s)", "float", 30.0,
+          "COMFY_FREE_WAIT_SEC", min=0, section="switching"),
+    Field("loading_max_sec", "arbiter", "Engine startup claim (s)", "int", 900, "LOADING_MAX_SEC", min=60,
+          help="How long a starting engine may hold the GPU before its claim expires.",
+          section="switching"),
+    Field("comfy_url", "arbiter", "ComfyUI URL", "str", "http://127.0.0.1:8188", "COMFY_URL",
+          help="Queue, model unload, and last-resort VRAM probe via /system_stats.",
+          section="switching"),
     Field("health_interval_sec", "arbiter", "Health check interval (s)", "float", 15.0,
           "HEALTH_INTERVAL_SEC", min=0.1,
-          help="How often to probe vLLM /health and ComfyUI /system_stats. Probes do not hold the arbiter lock."),
+          help="How often to probe vLLM /health and ComfyUI /system_stats. Probes do not hold the arbiter lock.",
+          section="health"),
     Field("health_timeout_sec", "arbiter", "Health check timeout (s)", "float", 5.0,
           "HEALTH_TIMEOUT_SEC", min=0.05,
-          help="HTTP timeout for each health probe. Also used to verify the engine after a wake."),
-    Field("comfy_free_wait_sec", "arbiter", "Wait for ComfyUI unload (s)", "float", 30.0,
-          "COMFY_FREE_WAIT_SEC", min=0),
-    Field("loading_max_sec", "arbiter", "Engine startup claim (s)", "int", 900, "LOADING_MAX_SEC", min=60,
-          help="How long a starting engine may hold the GPU before its claim expires."),
+          help="HTTP timeout for each health probe. Also used to verify the engine after a wake.",
+          section="health"),
+    Field("gpu_probe", "arbiter", "VRAM probe", "choice", "auto", "GPU_PROBE",
+          choices=("auto", "nvml", "nvidia-smi", "comfy", "off"),
+          help="auto tries NVML, then nvidia-smi, then ComfyUI. off disables probing.",
+          section="vram"),
+    Field("gpu_index", "arbiter", "GPU index", "int", 0, "GPU_INDEX", min=0,
+          help="Which NVIDIA GPU to read. Single-card hosts leave this at 0.",
+          section="vram"),
     Field("shared_vram", "arbiter", "Shared VRAM", "bool", False, "SHARED_VRAM",
           help="Off (default): one occupant at a time. On: keep several engines awake while "
                "their VRAM costs fit the budget; they serve in parallel. A wake that would not fit "
                "evicts least-recently used (after that victim's in-flight requests drain). "
-               "ComfyUI still takes the whole GPU."),
+               "ComfyUI still takes the whole GPU.",
+          section="budget"),
     Field("vram_budget_mb", "arbiter", "VRAM budget (MiB)", "int", 0, "VRAM_BUDGET_MB", min=0,
-          help="Card size used for shared placement. 0 = use the total from the VRAM probe."),
+          help="Card size used for shared placement. 0 = use the total from the VRAM probe.",
+          section="budget"),
     Field("vram_safety_mb", "arbiter", "VRAM safety margin (MiB)", "int", 1024, "VRAM_SAFETY_MB", min=0,
           help="Headroom left unused so a wake or a ComfyUI prompt does not OOM. "
-               "Usable budget is vram_budget_mb minus this."),
+               "Usable budget is vram_budget_mb minus this.",
+          section="budget"),
     # OVMS shim -----------------------------------------------------------------
     Field("ovms_enabled", "ovms", "Enabled", "bool", True, "OVMS_SHIM_ENABLED", live=False),
     Field("ovms_port", "ovms", "Listen port", "int", 8012, "OVMS_SHIM_PORT", live=False),
@@ -111,35 +137,85 @@ BY_KEY = {f.key: f for f in FIELDS}
 
 
 # ------------------------------------------------------------------ engines spec
+# :boot / :off (and :park / :on) after free_mb. Extra integers are ignored so a
+# later vram_mb field can land without breaking this parser.
+_ENGINE_FLAGS = {"boot": ("boot", True), "park": ("boot", False),
+                 "off": ("enabled", False), "on": ("enabled", True)}
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _normalize_engine(raw) -> dict:
+    if not isinstance(raw, dict):
+        raise ValueError(f"bad engine entry: {raw}")
+    e = dict(raw)  # keep unknown keys (vram_mb, quant, …) for a later budget PR
+    e["name"] = str(e.get("name", "")).strip()
+    e["backend"] = str(e.get("backend", "")).strip()
+    e["listen"] = int(e.get("listen") or 0)
+    e["free_mb"] = int(e.get("free_mb") or 0)
+    e["enabled"] = _as_bool(e.get("enabled", True), True)
+    e["boot"] = _as_bool(e.get("boot", False), False)
+    return e
+
+
 def parse_engines(spec: str | list) -> list[dict]:
-    """'name=host:port@listen:free_mb[:vram_mb],...' -> [{name, backend, listen, free_mb, ...}]"""
+    """'name=host:port@listen:free_mb[:vram_mb][:flag...],...' -> engine dicts."""
     if isinstance(spec, list):
-        return [dict(e) for e in spec]
+        return [_normalize_engine(e) for e in spec]
     out = []
     for item in filter(None, (s.strip() for s in spec.split(","))):
         name, rest = item.split("=", 1)
         backend, rest = rest.split("@", 1)
         parts = rest.split(":")
         listen = int(parts[0])
-        free_mb = int(parts[1] if len(parts) > 1 and parts[1] else 0)
-        row = {"name": name, "backend": backend, "listen": listen, "free_mb": free_mb}
-        if len(parts) > 2 and parts[2]:
-            row["vram_mb"] = int(parts[2])
-        out.append(row)
+        free_mb, flags = 0, []
+        if len(parts) > 1:
+            try:
+                free_mb = int(parts[1] or 0)
+                flags = parts[2:]
+            except ValueError:
+                flags = parts[1:]
+        entry = {"name": name, "backend": backend, "listen": listen, "free_mb": free_mb,
+                 "enabled": True, "boot": False}
+        for i, tok in enumerate(flags):
+            t = tok.strip().lower()
+            if not t:
+                continue
+            if t in _ENGINE_FLAGS:
+                key, val = _ENGINE_FLAGS[t]
+                entry[key] = val
+                continue
+            try:
+                n = int(t)
+            except ValueError:
+                raise ValueError(f"unknown engine flag {tok!r}") from None
+            if i == 0 and parts[1:2] and parts[1].strip().isdigit():
+                entry["vram_mb"] = n  # the field right after free_mb is the VRAM cost
+            # other numeric fields are reserved and ignored
+        out.append(entry)
     return out
 
 
 def _coerce(f: Field, value):
     if f.type == "engines":
         engines = parse_engines(value)
-        seen = set()
+        seen, boots = set(), []
         for e in engines:
-            name = str(e.get("name", "")).strip()
+            name = e["name"]
             host, _, port = str(e.get("backend", "")).rpartition(":")
             if not name or name in seen or not host or not port.isdigit():
                 raise ValueError(f"bad engine entry: {e}")
+            if e["free_mb"] < 0:
+                raise ValueError(f"{name}: free_mb must be >= 0")
             seen.add(name)
-            e.update(name=name, listen=int(e["listen"]), free_mb=int(e.get("free_mb") or 0))
+            if e["enabled"] and e["boot"]:
+                boots.append(name)
             for k in ("vram_mb", "n_params", "n_layers", "n_kv_heads", "n_heads", "head_dim",
                       "hidden_size", "context_length"):
                 if e.get(k) not in (None, ""):
@@ -148,6 +224,8 @@ def _coerce(f: Field, value):
                 if e.get(k):
                     e[k] = str(e[k])
                     quant_bytes(e[k])  # unknown quant -> ValueError at save time, not at wake
+        if len(boots) > 1:
+            raise ValueError(f"at most one enabled engine may load on boot, got {boots}")
         return engines
     if f.type == "bool":
         if isinstance(value, str):
@@ -208,6 +286,7 @@ class Settings:
             values = json.loads(json.dumps(self._values))
         return {
             "groups": GROUPS,
+            "sections": SECTIONS,
             "fields": [asdict(f) for f in FIELDS],
             "values": values,
             "restart_pending": self.restart_pending(),

@@ -13,7 +13,7 @@ Share one NVIDIA GPU between several local AI services without them fighting ove
   - moves stray `</think>` text out of answers
   - maps `/v1` paths to `/v3`
 - **Speech to text.** An OpenAI-compatible `/v1/audio/transcriptions` endpoint on the CPU. It uses Granite Speech CTC models through 🤗 Transformers.
-- **Dashboard.** Shows the live state of the parts above and lets you edit their settings.
+- **Dashboard.** Live status (owner, VRAM, wake/sleep) plus the settings that control the stack: which engines are on, which one loads on boot, and the switching knobs. Localhost only; there is no login.
 
 ![Dashboard](docs/dashboard.png)
 
@@ -34,7 +34,8 @@ ComfyUI ──► POST /gpu/acquire ──────┘                   slee
   - Level 2 drops the weights and reloads them from disk (the page cache when warm). Each sleeping engine keeps under 1 GiB of VRAM.
   - Level 1 keeps the weights in CPU RAM instead.
 - **ComfyUI jobs:** the hook in [`comfyui_node/`](comfyui_node/gpu_arbiter) calls `/gpu/acquire` before each prompt and `/gpu/release` after it. If Switchyard can't be reached, ComfyUI runs normally.
-- **Engine startup:** an engine container calls `POST /gpu/loading?engine=NAME` before it starts `vllm serve`. Loads are serialized, and each engine is put to sleep as soon as it is up.
+- **Engine startup:** an engine container calls `POST /gpu/loading?engine=NAME` before it starts `vllm serve`. Loads are serialized. Engines marked **boot** in the dashboard (or `:boot` in `ENGINES`) are woken once they are up; the rest stay parked until a request or a manual Wake.
+- **Availability:** an engine with **On** unchecked (or `:off` in `ENGINES`) is not bound and is not woken. Apply that change with a restart.
 - **Text-only engines:** image parts in requests to a text-only engine are replaced with a short note, so the request doesn't fail with HTTP 400.
 - **VRAM:** free/used/total are read from the GPU when possible (NVML, then `nvidia-smi`), with ComfyUI `/system_stats` as a fallback. `/gpu/status` and the dashboard show the reading and which source produced it. If nothing can be read, wake and unload log a warning and continue.
 - **Health:** a background thread probes each engine's `/health` and ComfyUI `/system_stats` every `HEALTH_INTERVAL_SEC` (HTTP calls do not hold the arbiter lock). State is `healthy`, `unhealthy`, or `unreachable`. An engine that is unhealthy, or unreachable after it has been up, is not sent traffic: clients get HTTP 503 with a `Retry-After` header. A failed wake (HTTP error, timeout, or still unhealthy after wake) is retried with exponential backoff (`WAKE_ATTEMPTS`, `WAKE_BACKOFF_SEC`). If every attempt fails, the engine is marked unhealthy, GPU ownership is released, and waiting requests fail fast instead of hanging. Traffic resumes automatically once a later health check succeeds.
@@ -77,7 +78,7 @@ python3 -m switchyard            # start; same as the `switchyard` console scrip
 # Optional desktop tray: python3 -m pip install -e ".[tray]"  then `switchyard tray`
 ```
 
-`ENGINES` is a comma-separated list of `name=backend_host:port@listen_port:free_MiB[:vram_MiB]`. `free_MiB` is the free-VRAM target used before a wake (and the cost fallback). Optional `vram_MiB` is that engine's resident cost for shared placement. Clients send their requests to the listen port.
+`ENGINES` is a comma-separated list of `name=backend_host:port@listen_port:free_MiB[:vram_MiB][:flag…]`. `free_MiB` is the free-VRAM target used before a wake (and the cost fallback). Optional `vram_MiB` is that engine's resident cost for shared placement. Optional flags: `boot` (wake this engine when Switchyard starts; at most one On engine) and `off` (do not bind or wake it). Clients send their requests to the listen port. The dashboard Engines table edits the same list.
 
 When `vram_MiB` is omitted, the cost is the MiB measured after a successful wake, else a quantization-aware estimate if the engine dict has `n_params` (and optional `quant`, `context_length`, `n_layers`, `n_kv_heads`, `head_dim`, `kv_quant`), else `free_MiB`. The estimator also exposes `gpu_layers_that_fit` for llama.cpp-style partial offload; it is not wired into placement yet.
 
@@ -110,7 +111,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | Variable | Default | Applies | Description |
 |---|---|---|---|
 | `ARBITER_ENABLED` | `true` | restart | Turns the arbiter on or off. |
-| `ENGINES` | `qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500` | restart | The vLLM engines sharing the GPU. Optional fifth field is `vram_mb`. `free_mb` and `vram_mb` apply live. |
+| `ENGINES` | `qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500` | restart | The vLLM engines sharing the GPU. Optional fifth field is `vram_mb`; optional `:boot` / `:off` flags. `free_mb` and `vram_mb` apply live; on/off and boot need a restart. |
 | `TEXT_ONLY_ENGINES` | `qwen` | live | Comma-separated. Image parts sent to these engines are replaced with a note. |
 | `COMFY_URL` | `http://127.0.0.1:8188` | live | ComfyUI address. Used to check the queue, unload models, and as a fallback VRAM probe. |
 | `GPU_PROBE` | `auto` | live | How to read VRAM: `auto` (NVML → nvidia-smi → ComfyUI), or force `nvml` / `nvidia-smi` / `comfy`, or `off`. |
@@ -168,6 +169,8 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | `OVMS_SHIM_PORT` | `/v1/*`, `/v1/rerank` | OVMS with OpenAI compatibility fixes |
 | `STT_PORT` | `POST /v1/audio/transcriptions`, `GET /v1/models`, `/health` | speech to text |
 | `DASHBOARD_PORT` | `/`, `/api/info`, `/api/status`, `/api/settings`, `/api/plugins`, `/api/action`, `/api/logs`, `/api/history`, `/api/restart` | dashboard |
+
+`GET /api/settings` includes `sections` (Engines, Switching & swapping, Health checks, VRAM probe, Shared VRAM budget) and per-engine `enabled` / `boot`.
 
 `GET /api/info` is unauthenticated (`version`, bind `host`, `auth_required`). Everything else under `/api/` needs the bearer token when `SWITCHYARD_TOKEN` is set. Mutating paths accept `POST` only, plus a same-origin `Origin` or the `X-Switchyard` header.
 
