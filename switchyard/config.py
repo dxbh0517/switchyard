@@ -12,6 +12,8 @@ import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .estimate import quant_bytes
+
 
 @dataclass(frozen=True)
 class Field:
@@ -36,11 +38,13 @@ GROUPS = {
     "dashboard": "Dashboard",
 }
 
-# Headings inside a settings group. A later memory-budget PR can add "budget" here.
+# Headings inside a settings group.
 SECTIONS = {
     "engines": "Engines",
     "switching": "Switching & swapping",
+    "health": "Health checks",
     "vram": "VRAM probe",
+    "budget": "Shared VRAM budget",
 }
 
 FIELDS: list[Field] = [
@@ -49,8 +53,9 @@ FIELDS: list[Field] = [
     Field("listen_host", "arbiter", "Listen host", "str", "0.0.0.0", "LISTEN_HOST", live=False),
     Field("engines", "arbiter", "Engines", "engines",
           "qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500", "ENGINES", live=False,
-          help="On/off, boot, name, backend and listen need a restart; free MiB applies live. "
-               "At most one On engine may load on boot. Optional ENGINES flags: :boot, :off.",
+          help="name=host:port@listen:free_mb[:vram_mb][:boot|:off]. On/off, boot, name, backend "
+               "and listen need a restart; free MiB and VRAM cost apply live. At most one On engine "
+               "may load on boot.",
           section="engines"),
     Field("text_only_engines", "arbiter", "Text-only engines", "str", "qwen", "TEXT_ONLY_ENGINES",
           help="Comma-separated. Image parts sent to these engines are replaced with a note.",
@@ -62,6 +67,10 @@ FIELDS: list[Field] = [
           help="1 keeps weights in CPU RAM (fast wake, uses RAM). 2 drops them (reload from disk).",
           section="switching"),
     Field("wake_attempts", "arbiter", "Wake attempts", "int", 3, "WAKE_ATTEMPTS", min=1, max=10,
+          help="How many times to try waking an engine before marking it unhealthy and returning HTTP 503.",
+          section="switching"),
+    Field("wake_backoff_sec", "arbiter", "Wake retry backoff (s)", "float", 1.0, "WAKE_BACKOFF_SEC", min=0,
+          help="Initial delay between wake attempts; doubles after each failure (1s, 2s, 4s, …).",
           section="switching"),
     Field("comfy_free_wait_sec", "arbiter", "Wait for ComfyUI unload (s)", "float", 30.0,
           "COMFY_FREE_WAIT_SEC", min=0, section="switching"),
@@ -71,6 +80,14 @@ FIELDS: list[Field] = [
     Field("comfy_url", "arbiter", "ComfyUI URL", "str", "http://127.0.0.1:8188", "COMFY_URL",
           help="Queue, model unload, and last-resort VRAM probe via /system_stats.",
           section="switching"),
+    Field("health_interval_sec", "arbiter", "Health check interval (s)", "float", 15.0,
+          "HEALTH_INTERVAL_SEC", min=0.1,
+          help="How often to probe vLLM /health and ComfyUI /system_stats. Probes do not hold the arbiter lock.",
+          section="health"),
+    Field("health_timeout_sec", "arbiter", "Health check timeout (s)", "float", 5.0,
+          "HEALTH_TIMEOUT_SEC", min=0.05,
+          help="HTTP timeout for each health probe. Also used to verify the engine after a wake.",
+          section="health"),
     Field("gpu_probe", "arbiter", "VRAM probe", "choice", "auto", "GPU_PROBE",
           choices=("auto", "nvml", "nvidia-smi", "comfy", "off"),
           help="auto tries NVML, then nvidia-smi, then ComfyUI. off disables probing.",
@@ -78,6 +95,19 @@ FIELDS: list[Field] = [
     Field("gpu_index", "arbiter", "GPU index", "int", 0, "GPU_INDEX", min=0,
           help="Which NVIDIA GPU to read. Single-card hosts leave this at 0.",
           section="vram"),
+    Field("shared_vram", "arbiter", "Shared VRAM", "bool", False, "SHARED_VRAM",
+          help="Off (default): one occupant at a time. On: keep several engines awake while "
+               "their VRAM costs fit the budget; they serve in parallel. A wake that would not fit "
+               "evicts least-recently used (after that victim's in-flight requests drain). "
+               "ComfyUI still takes the whole GPU.",
+          section="budget"),
+    Field("vram_budget_mb", "arbiter", "VRAM budget (MiB)", "int", 0, "VRAM_BUDGET_MB", min=0,
+          help="Card size used for shared placement. 0 = use the total from the VRAM probe.",
+          section="budget"),
+    Field("vram_safety_mb", "arbiter", "VRAM safety margin (MiB)", "int", 1024, "VRAM_SAFETY_MB", min=0,
+          help="Headroom left unused so a wake or a ComfyUI prompt does not OOM. "
+               "Usable budget is vram_budget_mb minus this.",
+          section="budget"),
     # OVMS shim -----------------------------------------------------------------
     Field("ovms_enabled", "ovms", "Enabled", "bool", True, "OVMS_SHIM_ENABLED", live=False),
     Field("ovms_port", "ovms", "Listen port", "int", 8012, "OVMS_SHIM_PORT", live=False),
@@ -96,8 +126,12 @@ FIELDS: list[Field] = [
           help="Long audio is cut at the quietest point near each boundary."),
     # Dashboard -----------------------------------------------------------------
     Field("dashboard_host", "dashboard", "Listen host", "str", "127.0.0.1", "DASHBOARD_HOST", live=False,
-          help="The dashboard can change settings and has no login; keep it on localhost."),
+          help="127.0.0.1 keeps the dashboard local. 0.0.0.0 exposes it; set SWITCHYARD_TOKEN if you do."),
     Field("dashboard_port", "dashboard", "Listen port", "int", 8100, "DASHBOARD_PORT", live=False),
+    Field("dashboard_token", "dashboard", "API token", "str", "", "SWITCHYARD_TOKEN",
+          help="When set, every dashboard API call needs Authorization: Bearer <token>. "
+               "Required if the dashboard is reachable from other machines. Write-only: "
+               "the current value is never shown here."),
 ]
 BY_KEY = {f.key: f for f in FIELDS}
 
@@ -131,7 +165,7 @@ def _normalize_engine(raw) -> dict:
 
 
 def parse_engines(spec: str | list) -> list[dict]:
-    """'name=host:port@listen:free_mb[:flag...],...' -> engine dicts."""
+    """'name=host:port@listen:free_mb[:vram_mb][:flag...],...' -> engine dicts."""
     if isinstance(spec, list):
         return [_normalize_engine(e) for e in spec]
     out = []
@@ -143,13 +177,13 @@ def parse_engines(spec: str | list) -> list[dict]:
         free_mb, flags = 0, []
         if len(parts) > 1:
             try:
-                free_mb = int(parts[1])
+                free_mb = int(parts[1] or 0)
                 flags = parts[2:]
             except ValueError:
                 flags = parts[1:]
         entry = {"name": name, "backend": backend, "listen": listen, "free_mb": free_mb,
                  "enabled": True, "boot": False}
-        for tok in flags:
+        for i, tok in enumerate(flags):
             t = tok.strip().lower()
             if not t:
                 continue
@@ -158,9 +192,12 @@ def parse_engines(spec: str | list) -> list[dict]:
                 entry[key] = val
                 continue
             try:
-                int(t)  # reserved numeric slot (e.g. future vram_mb)
+                n = int(t)
             except ValueError:
                 raise ValueError(f"unknown engine flag {tok!r}") from None
+            if i == 0 and parts[1:2] and parts[1].strip().isdigit():
+                entry["vram_mb"] = n  # the field right after free_mb is the VRAM cost
+            # other numeric fields are reserved and ignored
         out.append(entry)
     return out
 
@@ -179,6 +216,14 @@ def _coerce(f: Field, value):
             seen.add(name)
             if e["enabled"] and e["boot"]:
                 boots.append(name)
+            for k in ("vram_mb", "n_params", "n_layers", "n_kv_heads", "n_heads", "head_dim",
+                      "hidden_size", "context_length"):
+                if e.get(k) not in (None, ""):
+                    e[k] = int(float(e[k]))
+            for k in ("quant", "kv_quant"):
+                if e.get(k):
+                    e[k] = str(e[k])
+                    quant_bytes(e[k])  # unknown quant -> ValueError at save time, not at wake
         if len(boots) > 1:
             raise ValueError(f"at most one enabled engine may load on boot, got {boots}")
         return engines
