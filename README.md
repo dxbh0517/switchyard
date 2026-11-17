@@ -94,7 +94,7 @@ The vLLM engines must run with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1
 
 To install the ComfyUI hook, copy `comfyui_node/gpu_arbiter` into `ComfyUI/custom_nodes/`. If Switchyard isn't reachable at `http://host.docker.internal:8000`, set `GPU_ARBITER_URL`.
 
-Without Docker, run `python3 -m switchyard`. Set `SWITCHYARD_SETTINGS` to say where the settings file goes. `python3 -m switchyard --help` (or `switchyard --help`) prints the version, key environment variables, and a reminder that the dashboard has no auth and should stay on localhost. `--version` prints the version and exits.
+Without Docker, run `python3 -m switchyard`. Set `SWITCHYARD_SETTINGS` to say where the settings file goes. `python3 -m switchyard --help` (or `switchyard --help`) prints the version, the subcommands (`ctl`, `tray`, `update`), key environment variables, and a reminder to keep the dashboard on localhost or set `SWITCHYARD_TOKEN`. `--version` prints the version and exits.
 
 ## Settings
 
@@ -145,8 +145,9 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 
 | Variable | Default | Applies | Description |
 |---|---|---|---|
-| `DASHBOARD_HOST` | `127.0.0.1` | restart | The dashboard can change settings and has no login, so keep it on localhost. |
+| `DASHBOARD_HOST` | `127.0.0.1` | restart | Bind address. `127.0.0.1` is local only; `0.0.0.0` is reachable on the LAN. |
 | `DASHBOARD_PORT` | `8100` | restart | Port the dashboard listens on. |
+| `SWITCHYARD_TOKEN` | _(empty)_ | live | When set, the dashboard API requires `Authorization: Bearer <token>`. |
 
 ## Endpoints
 
@@ -158,9 +159,43 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | engine ports | `POST /gpu/loading?engine=NAME` | engine startup claim |
 | `OVMS_SHIM_PORT` | `/v1/*`, `/v1/rerank` | OVMS with OpenAI compatibility fixes |
 | `STT_PORT` | `POST /v1/audio/transcriptions`, `GET /v1/models`, `/health` | speech to text |
-| `DASHBOARD_PORT` | `/`, `/api/status`, `/api/settings`, `/api/plugins`, `/api/action`, `/api/logs`, `/api/restart` | dashboard |
+| `DASHBOARD_PORT` | `/`, `/api/info`, `/api/status`, `/api/settings`, `/api/plugins`, `/api/action`, `/api/logs`, `/api/restart` | dashboard |
 
-The dashboard API only accepts `POST` requests from its own origin. `switchyard ctl` does not send an `Origin` header, so it can call the same API from an SSH session.
+`GET /api/info` is unauthenticated (`version`, bind `host`, `auth_required`). Everything else under `/api/` needs the bearer token when `SWITCHYARD_TOKEN` is set. Mutating paths accept `POST` only, plus a same-origin `Origin` or the `X-Switchyard` header.
+
+## Remote dashboard
+
+The dashboard talks to the same Switchyard process that owns the GPU arbiter. By default it listens on `127.0.0.1:8100`, so only that machine can open it. To use it from another computer:
+
+**Bind on the LAN and set a token**
+
+```sh
+export DASHBOARD_HOST=0.0.0.0
+export SWITCHYARD_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+python3 -m switchyard
+# On the other machine: http://<gpu-host>:8100/
+```
+
+The page asks for the token once, stores it in `localStorage`, and sends it on every `fetch`. Binding off loopback with an empty token logs a warning and shows a banner in the UI.
+
+**SSH tunnel** (dashboard stays on localhost)
+
+```sh
+ssh -L 8100:127.0.0.1:8100 user@gpu-host
+# open http://127.0.0.1:8100/ on your laptop
+```
+
+Leave `DASHBOARD_HOST=127.0.0.1`. No token is required.
+
+Scripts talking to the API from outside a browser must send the CSRF header:
+
+```sh
+curl -sH "Authorization: Bearer $SWITCHYARD_TOKEN" -H "X-Switchyard: 1" \
+  -H "Content-Type: application/json" -d '{"idle_sleep_sec": 60}' \
+  http://gpu-host:8100/api/settings
+```
+
+Switchyard speaks HTTP only. For TLS, put Caddy, nginx, or another reverse proxy in front and terminate HTTPS there.
 
 ## CLI
 
@@ -177,7 +212,7 @@ switchyard ctl budget             # VRAM / memory numbers the server exposes tod
 switchyard ctl --json status      # --json also works after the command
 ```
 
-`--host` / `--port` override the dashboard address. `SWITCHYARD_URL` (for example `http://127.0.0.1:8100`) is used when they are omitted. `--token` or `SWITCHYARD_TOKEN` is sent as `Authorization: Bearer …` and is harmless if the server ignores it.
+`--host` / `--port` override the dashboard address. `SWITCHYARD_URL` (for example `http://127.0.0.1:8100`) is used when they are omitted. `--token` or `SWITCHYARD_TOKEN` is sent as `Authorization: Bearer …` (needed when the server sets `SWITCHYARD_TOKEN`). `ctl` sends the `X-Switchyard` header, so it passes the CSRF check without an `Origin`.
 
 SSH from a laptop, with the dashboard staying on localhost:
 

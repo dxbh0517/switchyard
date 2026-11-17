@@ -26,11 +26,12 @@ Environment:
   DASHBOARD_HOST       Dashboard bind address (default: 127.0.0.1)
   LISTEN_HOST          Bind address for arbiter, OVMS shim, and STT
   SWITCHYARD_URL       Dashboard URL for ctl and tray (default: http://127.0.0.1:8100)
+  SWITCHYARD_TOKEN     Bearer token the dashboard API requires (empty = no auth)
 
 See the README for the full list.
 
-Warning: the dashboard has no auth and can change settings.
-Keep DASHBOARD_HOST on localhost.
+Warning: the dashboard can change settings. Keep DASHBOARD_HOST on localhost,
+or set SWITCHYARD_TOKEN before exposing it.
 """
 
 
