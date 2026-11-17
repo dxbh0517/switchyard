@@ -17,7 +17,7 @@ Share one NVIDIA GPU between several local AI services without them fighting ove
 
 ![Dashboard](docs/dashboard.png)
 
-Every part is optional, and nothing changes for clients: each one keeps its own port, so you can drop Switchyard in where separate proxies used to be. The arbiter and the shim only use the Python standard library. Speech to text adds `torch`, `transformers` and `ffmpeg`.
+Every part is optional, and nothing changes for clients: each one keeps its own port, so you can drop Switchyard in where separate proxies used to be. The arbiter and the shim only use the Python standard library. Speech to text adds `torch`, `transformers` and `ffmpeg`. An optional `nvml` extra (`nvidia-ml-py`) lets the arbiter read VRAM through NVML; without it, `nvidia-smi` or ComfyUI is used.
 
 ## How the GPU arbiter works
 
@@ -35,6 +35,7 @@ ComfyUI ──► POST /gpu/acquire ──────┘                   put 
 - **ComfyUI jobs:** the hook in [`comfyui_node/`](comfyui_node/gpu_arbiter) calls `/gpu/acquire` before each prompt and `/gpu/release` after it. If Switchyard can't be reached, ComfyUI runs normally.
 - **Engine startup:** an engine container calls `POST /gpu/loading?engine=NAME` before it starts `vllm serve`. Loads are serialized, and each engine is put to sleep as soon as it is up.
 - **Text-only engines:** image parts in requests to a text-only engine are replaced with a short note, so the request doesn't fail with HTTP 400.
+- **VRAM:** free/used/total are read from the GPU when possible (NVML, then `nvidia-smi`), with ComfyUI `/system_stats` as a fallback. `/gpu/status` and the dashboard show the reading and which source produced it. If nothing can be read, wake and unload log a warning and continue.
 
 ## Quick start
 
@@ -67,8 +68,10 @@ volumes:
 
 ```sh
 python3 -m pip install -e .
-python3 -m switchyard
+python3 -m switchyard --help     # env vars and dashboard bind warning
+python3 -m switchyard            # start; same as the `switchyard` console script
 # Optional STT: python3 -m pip install -e ".[stt]"  (also needs ffmpeg)
+# Optional NVML VRAM probe: python3 -m pip install -e ".[nvml]"
 ```
 
 `ENGINES` is a comma-separated list of `name=backend_host:port@listen_port:free_MiB_needed_to_wake`. Clients send their requests to the listen port.
@@ -89,7 +92,7 @@ The vLLM engines must run with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1
 
 To install the ComfyUI hook, copy `comfyui_node/gpu_arbiter` into `ComfyUI/custom_nodes/`. If Switchyard isn't reachable at `http://host.docker.internal:8000`, set `GPU_ARBITER_URL`.
 
-Without Docker, run `python3 -m switchyard`. Set `SWITCHYARD_SETTINGS` to say where the settings file goes.
+Without Docker, run `python3 -m switchyard`. Set `SWITCHYARD_SETTINGS` to say where the settings file goes. `python3 -m switchyard --help` (or `switchyard --help`) prints the version, key environment variables, and a reminder that the dashboard has no auth and should stay on localhost. `--version` prints the version and exits.
 
 ## Settings
 
@@ -102,8 +105,10 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | `ARBITER_ENABLED` | `true` | restart | Turns the arbiter on or off. |
 | `ENGINES` | `qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500` | restart | The vLLM engines sharing the GPU. The free-VRAM target applies live. |
 | `TEXT_ONLY_ENGINES` | `qwen` | live | Comma-separated. Image parts sent to these engines are replaced with a note. |
-| `COMFY_URL` | `http://127.0.0.1:8188` | live | ComfyUI address. Used to read VRAM, check the queue and unload models. |
-| `LISTEN_HOST` | `0.0.0.0` | restart | Address the engine ports bind to. |
+| `COMFY_URL` | `http://127.0.0.1:8188` | live | ComfyUI address. Used to check the queue, unload models, and as a fallback VRAM probe. |
+| `GPU_PROBE` | `auto` | live | How to read VRAM: `auto` (NVML → nvidia-smi → ComfyUI), or force `nvml` / `nvidia-smi` / `comfy`, or `off`. |
+| `GPU_INDEX` | `0` | live | Which NVIDIA GPU to read. Single-card hosts leave this at 0. |
+| `LISTEN_HOST` | `0.0.0.0` | restart | Address the arbiter, OVMS shim, and STT servers bind to. |
 | `IDLE_SLEEP_SEC` | `120` | live | An awake engine with no traffic for this long goes back to sleep. |
 | `SLEEP_LEVEL` | `2` | live | `1` keeps weights in CPU RAM (fast wake). `2` drops them (reload from disk). |
 | `WAKE_ATTEMPTS` | `3` | live | How many times to try waking an engine before returning HTTP 503. |
@@ -115,7 +120,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | Variable | Default | Applies | Description |
 |---|---|---|---|
 | `OVMS_SHIM_ENABLED` | `true` | restart | Turns the shim on or off. |
-| `OVMS_SHIM_PORT` | `8012` | restart | Port the shim listens on. |
+| `OVMS_SHIM_PORT` | `8012` | restart | Port the shim listens on (`LISTEN_HOST`). |
 | `OVMS_UPSTREAM` | `http://127.0.0.1:8010` | live | OVMS REST address. |
 | `RERANK_MODEL` | `qwen3-reranker-0.6b` | live | OVMS model name used for `/v1/rerank`. |
 | `RERANK_INSTRUCTION` | `Given a web search query, …` | live | Default instruction in the Qwen3-Reranker prompt. |
@@ -125,7 +130,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | Variable | Default | Applies | Description |
 |---|---|---|---|
 | `STT_ENABLED` | `true` | restart | Turns speech to text on or off. |
-| `STT_PORT` | `8091` | restart | Port the speech-to-text server listens on. |
+| `STT_PORT` | `8091` | restart | Port the speech-to-text server listens on (`LISTEN_HOST`). |
 | `STT_MODEL_PATH` | `/models/granite-speech-5.0-470m-turboctc` | live | Path to the model. Changing it reloads the model. |
 | `STT_MODEL_ID` | `granite-speech-5.0-470m-turboctc` | live | Name reported by `/v1/models`. |
 | `STT_THREADS` | `8` | live | CPU threads per transcription. |
@@ -149,7 +154,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | engine ports | `POST /gpu/loading?engine=NAME` | engine startup claim |
 | `OVMS_SHIM_PORT` | `/v1/*`, `/v1/rerank` | OVMS with OpenAI compatibility fixes |
 | `STT_PORT` | `POST /v1/audio/transcriptions`, `GET /v1/models`, `/health` | speech to text |
-| `DASHBOARD_PORT` | `/`, `/api/info`, `/api/status`, `/api/settings`, `/api/action`, `/api/logs`, `/api/restart` | dashboard |
+| `DASHBOARD_PORT` | `/`, `/api/info`, `/api/status`, `/api/settings`, `/api/plugins`, `/api/action`, `/api/logs`, `/api/restart` | dashboard |
 
 `GET /api/info` is unauthenticated (`version`, bind `host`, `auth_required`). Everything else under `/api/` needs the bearer token when `SWITCHYARD_TOKEN` is set. Mutating paths accept `POST` only, plus a same-origin `Origin` or the `X-Switchyard` header.
 
@@ -187,6 +192,37 @@ curl -sH "Authorization: Bearer $SWITCHYARD_TOKEN" -H "X-Switchyard: 1" \
 
 Switchyard speaks HTTP only. For TLS, put Caddy, nginx, or another reverse proxy in front and terminate HTTPS there.
 
+## CLI
+
+`switchyard ctl` (also installed as `switchyardctl`, or `python -m switchyard ctl`) talks to a **running** Switchyard over that dashboard JSON API. It does not start the arbiter, and it does not duplicate wake/sleep/unload logic.
+
+```sh
+# on the GPU box (dashboard defaults to 127.0.0.1:8100)
+switchyard ctl status
+switchyard ctl engines
+switchyard ctl wake qwen          # aliases: load, swap (give this engine the GPU)
+switchyard ctl sleep vision       # alias: unload
+switchyard ctl comfy-unload
+switchyard ctl budget             # VRAM / memory numbers the server exposes today
+switchyard ctl --json status      # --json also works after the command
+```
+
+`--host` / `--port` override the dashboard address. `SWITCHYARD_URL` (for example `http://127.0.0.1:8100`) is used when they are omitted. `--token` or `SWITCHYARD_TOKEN` is sent as `Authorization: Bearer …` (needed when the server sets `SWITCHYARD_TOKEN`). `ctl` sends the `X-Switchyard` header, so it passes the CSRF check without an `Origin`.
+
+SSH from a laptop, with the dashboard staying on localhost:
+
+```sh
+ssh gpu-box 'switchyard ctl status'
+ssh gpu-box 'switchyardctl swap qwen'
+
+# or tunnel the dashboard and run ctl locally
+ssh -L 8100:127.0.0.1:8100 gpu-box
+export SWITCHYARD_URL=http://127.0.0.1:8100
+switchyard ctl status
+```
+
+Unreachable servers and HTTP errors print a short message on stderr and exit non-zero. Extra fields that later builds may add (GPU probe source, shared-VRAM budget, …) are shown when present and ignored when missing.
+
 ## Development
 
 ```sh
@@ -194,7 +230,7 @@ python3 -m pip install -e .
 python3 -m unittest discover -s tests     # stdlib only; uses fake vLLM/ComfyUI/OVMS servers
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, PR expectations, and [good first issues](https://github.com/dxbh0517/switchyard/labels/good%20first%20issue).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, PR expectations, and [good first issues](https://github.com/dxbh0517/switchyard/labels/good%20first%20issue). Third-party GPU occupants can be dropped in as engine adapters; the contract and loader are documented in [docs/plugins.md](docs/plugins.md) (the arbiter does not route traffic through them yet).
 
 ## License
 

@@ -3,6 +3,7 @@
 GET  /api/info                  version, bind host, whether a token is required (no auth)
 GET  /api/status                live state of every component
 GET  /api/settings              schema + current values
+GET  /api/plugins               discovered engine adapters (read-only; not used for occupancy yet)
 POST /api/settings              {"key": value, ...}
 POST /api/action                {"component": "arbiter|stt", "action": "...", "target": "..."}
 GET  /api/logs?since=ID         activity log
@@ -18,6 +19,7 @@ import hmac
 import ipaddress
 import json
 import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -27,10 +29,12 @@ from . import __version__, events
 from .config import Settings
 from .events import log
 from .httputil import Handler, Server
+from .plugins import discover
 
 INDEX = (Path(__file__).parent / "static" / "index.html").read_bytes()
 CSRF_HEADER = "X-Switchyard"
 MUTATING = {"/api/settings", "/api/action", "/api/restart"}
+SECRET_KEYS = ("dashboard_token",)
 EXPOSED_NO_TOKEN = (
     "DASHBOARD_HOST is {host} (not loopback) and SWITCHYARD_TOKEN is empty; "
     "anyone who can reach the dashboard can change settings. Set SWITCHYARD_TOKEN, "
@@ -75,6 +79,29 @@ def _bearer_ok(expected: str, header: str | None) -> bool:
     return hmac.compare_digest(got_b, exp)
 
 
+def _host_ok(host_header: str | None, bind_host: str) -> bool:
+    """Without a token, refuse Host names a DNS-rebinding page could use.
+
+    A rebinding attack points attacker.example at 127.0.0.1; the browser then
+    treats the dashboard as same-origin with the attacker's page, so the Origin
+    check passes. An IP literal, localhost, this machine's own name or the
+    configured bind host cannot be rebound by a third party.
+    """
+    hostname = urlparse("//" + (host_header or "")).hostname or ""
+    hostname = hostname.lower().rstrip(".")
+    if not hostname:
+        return False
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(hostname.split("%", 1)[0])
+        return True
+    except ValueError:
+        pass
+    allowed = {(bind_host or "").lower(), socket.gethostname().lower(), socket.getfqdn().lower()}
+    return hostname in allowed
+
+
 def _csrf_ok(handler: Handler) -> bool:
     """Same-origin Origin, or X-Switchyard (so a <form> on another site cannot POST)."""
     origin = handler.headers.get("Origin")
@@ -89,6 +116,8 @@ class Dashboard:
         self.s = settings
         self.c = components   # name -> component (or None when disabled)
         self.server: Server | None = None
+        self._plugins = None  # discovered once; plugin sources come from env (restart-scoped)
+        self._plugins_lock = threading.Lock()
 
     def token(self) -> str:
         return (self.s.get("dashboard_token") or "").strip()
@@ -100,6 +129,22 @@ class Dashboard:
             "host": hostport(host, port),
             "auth_required": bool(self.token()),
         }
+
+    def schema(self) -> dict:
+        """Settings schema with secrets blanked: the token is write-only over the API."""
+        out = self.s.schema()
+        for key in SECRET_KEYS:
+            if out["values"].get(key):
+                out["values"][key] = ""
+                out.setdefault("secrets_set", []).append(key)
+        return out
+
+    def plugins(self) -> dict:
+        # Discovery imports and runs plugin modules, so do it once rather than on every GET.
+        with self._plugins_lock:
+            if self._plugins is None:
+                self._plugins = discover().as_dict()
+            return self._plugins
 
     def status(self) -> dict:
         out = {"version": __version__, "uptime": round(time.time() - events.STARTED),
@@ -130,6 +175,10 @@ class Dashboard:
                     self.send_json(401, {"error": "unauthorized"},
                                    extra={"WWW-Authenticate": "Bearer"})
                     return False
+                if not token and not _host_ok(self.headers.get("Host"), dash.s.get("dashboard_host")):
+                    self.send_json(403, {"error": "unrecognized Host header; use an IP address or "
+                                                  "localhost, or set SWITCHYARD_TOKEN"})
+                    return False
                 return True
 
             def do_GET(self):  # noqa: N802
@@ -148,10 +197,16 @@ class Dashboard:
                 if u.path == "/api/status":
                     self.send_json(200, dash.status())
                 elif u.path == "/api/settings":
-                    self.send_json(200, dash.s.schema())
+                    self.send_json(200, dash.schema())
                 elif u.path == "/api/logs":
-                    since = int((parse_qs(u.query).get("since") or ["0"])[0])
+                    try:
+                        since = int((parse_qs(u.query).get("since") or ["0"])[0])
+                    except ValueError:
+                        self.send_json(400, {"error": "since must be an integer"})
+                        return
                     self.send_json(200, events.since(since))
+                elif u.path == "/api/plugins":
+                    self.send_json(200, dash.plugins())
                 else:
                     self.send_json(404, {"error": "not found"})
 
