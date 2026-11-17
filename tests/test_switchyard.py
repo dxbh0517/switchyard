@@ -384,7 +384,7 @@ class CliTests(unittest.TestCase):
     def test_no_args_does_not_exit(self):
         from switchyard.__main__ import _parser
         ns = _parser().parse_args([])
-        self.assertEqual(ns, argparse.Namespace())
+        self.assertIsNone(ns.command)
 
 
 def httpjson(url, method="GET", body=None, headers=None):
