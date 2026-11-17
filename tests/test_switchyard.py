@@ -169,6 +169,14 @@ class ConfigTests(unittest.TestCase):
             self.assertNotIn("idle_sleep_sec", saved)
             self.assertEqual(saved["stt_port"], 9999)
 
+    def test_health_defaults(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = config.Settings(os.path.join(d, "s.json"))
+            self.assertEqual(s.get("wake_attempts"), 3)
+            self.assertEqual(s.get("wake_backoff_sec"), 1.0)
+            self.assertEqual(s.get("health_interval_sec"), 15.0)
+            self.assertEqual(s.get("health_timeout_sec"), 5.0)
+
 
 class HelperTests(unittest.TestCase):
     def test_strip_images(self):
