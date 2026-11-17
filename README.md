@@ -93,7 +93,7 @@ The vLLM engines must run with `--enable-sleep-mode` and `VLLM_SERVER_DEV_MODE=1
 
 To install the ComfyUI hook, copy `comfyui_node/gpu_arbiter` into `ComfyUI/custom_nodes/`. If Switchyard isn't reachable at `http://host.docker.internal:8000`, set `GPU_ARBITER_URL`.
 
-Without Docker, run `python3 -m switchyard`. Set `SWITCHYARD_SETTINGS` to say where the settings file goes. `python3 -m switchyard --help` (or `switchyard --help`) prints the version, key environment variables, and a reminder that the dashboard has no auth and should stay on localhost. `--version` prints the version and exits.
+Without Docker, run `python3 -m switchyard`. Set `SWITCHYARD_SETTINGS` to say where the settings file goes. `python3 -m switchyard --help` (or `switchyard --help`) prints the version, the subcommands (`ctl`, `tray`, `update`), key environment variables, and a reminder to keep the dashboard on localhost or set `SWITCHYARD_TOKEN`. `--version` prints the version and exits.
 
 ## Settings
 
