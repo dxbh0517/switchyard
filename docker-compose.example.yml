@@ -1,4 +1,11 @@
-# Example stack wiring. Copy to docker-compose.yml and adjust hosts/ports/models.
+# Example stack wiring: Switchyard + two vLLM engines sharing one GPU.
+# Copy to docker-compose.yml and adjust hosts/ports/models.
+# Walkthrough (port map, startup order, troubleshooting): docs/compose-two-engines.md
+#
+# Port map (matches ENGINES below):
+#   clients ──► :8000 ──► Switchyard ──► vllm-qwen   on :8002
+#   clients ──► :8005 ──► Switchyard ──► vllm-vision on :8003
+# Clients only ever talk to the listen ports (8000, 8005). Never point them at 8002/8003.
 services:
   switchyard:
     build: .
@@ -10,9 +17,79 @@ services:
       - ./models/granite-speech-5.0-470m-turboctc:/models/granite-speech-5.0-470m-turboctc:ro
       - switchyard-data:/data      # settings saved from the dashboard
     environment:
+      # name=backend_host:backend_port@listen_port:free_MiB
       - ENGINES=qwen=127.0.0.1:8002@8000:21400,vision=127.0.0.1:8003@8005:17500
       - TEXT_ONLY_ENGINES=qwen
       - COMFY_URL=http://127.0.0.1:8188
       - OVMS_UPSTREAM=http://127.0.0.1:8010
+
+  # ── vLLM engines ────────────────────────────────────────────────────────────
+  # Placeholders: swap the image tag and model names for your own. Each engine
+  # must run with --enable-sleep-mode and VLLM_SERVER_DEV_MODE=1 so Switchyard
+  # can call /sleep and /wake_up. The entrypoint claims the GPU via
+  # POST /gpu/loading before `vllm serve` starts, so the two engines load one
+  # at a time instead of racing for VRAM.
+  vllm-qwen:
+    image: vllm/vllm-openai:latest          # pin a version you have tested
+    container_name: vllm-qwen
+    restart: unless-stopped
+    network_mode: host                      # so 127.0.0.1:8000 below is Switchyard
+    ipc: host
+    depends_on: [switchyard]
+    environment:
+      - VLLM_SERVER_DEV_MODE=1
+      # - HF_TOKEN=...                      # for gated models
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        python3 -c "import urllib.request as u
+        try: u.urlopen(u.Request('http://127.0.0.1:8000/gpu/loading?engine=qwen', data=b'{}', method='POST'), timeout=3600).read()
+        except Exception as e: print('gpu claim skipped:', e)"
+        exec vllm serve "$$@"
+      - vllm-serve
+    command:
+      - Qwen/Qwen3-8B                       # placeholder model
+      - --port=8002                         # backend port from ENGINES (not 8000!)
+      - --enable-sleep-mode
+      - --gpu-memory-utilization=0.85
+
+  vllm-vision:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-vision
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    depends_on: [switchyard]
+    environment:
+      - VLLM_SERVER_DEV_MODE=1
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        python3 -c "import urllib.request as u
+        try: u.urlopen(u.Request('http://127.0.0.1:8000/gpu/loading?engine=vision', data=b'{}', method='POST'), timeout=3600).read()
+        except Exception as e: print('gpu claim skipped:', e)"
+        exec vllm serve "$$@"
+      - vllm-serve
+    command:
+      - Qwen/Qwen2.5-VL-7B-Instruct         # placeholder model
+      - --port=8003                         # backend port from ENGINES
+      - --enable-sleep-mode
+      - --gpu-memory-utilization=0.85
+
 volumes:
   switchyard-data:
+  hf-cache:

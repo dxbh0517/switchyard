@@ -44,7 +44,7 @@ ComfyUI ──► POST /gpu/acquire ──────┘                   slee
 
 ### Docker
 
-Copy [`docker-compose.example.yml`](docker-compose.example.yml) and adjust ports/models, or start from:
+Copy [`docker-compose.example.yml`](docker-compose.example.yml) (Switchyard plus two vLLM engines; walkthrough in [docs/compose-two-engines.md](docs/compose-two-engines.md)) and adjust ports/models, or start from:
 
 ```yaml
 # docker-compose.yml
