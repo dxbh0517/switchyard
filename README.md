@@ -21,11 +21,26 @@ Every part is optional, and nothing changes for clients: each one keeps its own 
 
 ## How the GPU arbiter works
 
+```mermaid
+flowchart LR
+    C1["Client"] -->|"OpenAI API"| L1
+    C2["Client"] -->|"OpenAI API"| L2
+    HOOK["ComfyUI hook<br/>(before / after each prompt)"] -->|"POST /gpu/acquire<br/>POST /gpu/release"| L1
+
+    subgraph SY["Switchyard"]
+        L1[":8000<br/>engine qwen"]
+        L2[":8005<br/>engine vision"]
+        ARB{{"GPU arbiter<br/>wake the engine that is needed;<br/>sleep others only when exclusive,<br/>or when the budget requires it"}}
+        L1 --> ARB
+        L2 --> ARB
+    end
+
+    ARB -->|"/wake_up · /sleep · proxy"| V1["vLLM qwen<br/>:8002"]
+    ARB -->|"/wake_up · /sleep · proxy"| V2["vLLM vision<br/>:8003"]
+    ARB -->|"/free (unload models)"| CU["ComfyUI<br/>:8188"]
 ```
-client ──► :8000 (engine "qwen") ──┐
-client ──► :8005 (engine "vision") ─┼──► Switchyard ──► wake the engine that is needed;
-ComfyUI ──► POST /gpu/acquire ──────┘                   sleep others only when exclusive, or when the budget requires it
-```
+
+Ports match the default `ENGINES` value (`qwen=127.0.0.1:8002@8000:…,vision=127.0.0.1:8003@8005:…`): clients use the listen port, Switchyard forwards to the backend port.
 
 - **When a request arrives:** In the default exclusive mode, Switchyard waits for any ComfyUI job and for other engines' requests to finish, puts the current owner to sleep or asks ComfyUI to unload, then wakes the requested engine and forwards the request. Responses are streamed, so SSE works.
 - **Shared VRAM (`SHARED_VRAM=true`):** engines that already fit stay awake and serve in parallel. A wake that would exceed the card budget minus `VRAM_SAFETY_MB` waits only for the least-recently used victim's in-flight requests, then evicts it. Occupancy HTTP (sleep/wake/ComfyUI) does not hold the arbiter lock. ComfyUI still takes the whole GPU for a prompt. If the budget is unknown (no `VRAM_BUDGET_MB` and the VRAM probe has no total), shared mode falls back to exclusive eviction.
