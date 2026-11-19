@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import sqlite3
 import tempfile
 import threading
@@ -14,15 +13,14 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+import _ports
 from switchyard import analytics, config
 from switchyard.dashboard import Dashboard
 from switchyard.httputil import Server
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return _ports.free_port()
 
 
 def serve(handler) -> tuple[Server, int]:

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import sys
 import tempfile
 import textwrap
@@ -11,6 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 
+import _ports
 from switchyard import config
 from switchyard.httputil import Server
 from switchyard.plugins.api import (
@@ -355,9 +355,7 @@ class PluginsApiTests(unittest.TestCase):
 
 
 def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return _ports.free_port()
 
 
 if __name__ == "__main__":
