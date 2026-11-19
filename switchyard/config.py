@@ -35,6 +35,7 @@ GROUPS = {
     "arbiter": "GPU arbiter",
     "ovms": "OVMS shim",
     "stt": "Speech to text",
+    "hub": "Hub",
     "dashboard": "Dashboard",
 }
 
@@ -124,6 +125,20 @@ FIELDS: list[Field] = [
     Field("stt_threads", "stt", "CPU threads", "int", 8, "STT_THREADS", min=1, max=64),
     Field("stt_chunk_sec", "stt", "Chunk length (s)", "float", 30.0, "STT_CHUNK_SEC", min=5, max=120,
           help="Long audio is cut at the quietest point near each boundary."),
+    # Hub -----------------------------------------------------------------------
+    Field("hub_enabled", "hub", "Enabled", "bool", False, "HUB_ENABLED", live=False,
+          help="Model guides for ComfyUI, shared skills and an MCP gateway on one port."),
+    Field("hub_host", "hub", "Listen host", "str", "", "HUB_HOST", live=False,
+          help="Empty = LISTEN_HOST. The hub proxies MCP servers, so bind it narrowly "
+               "(e.g. 127.0.0.1, or the docker bridge 172.17.0.1) or set a token."),
+    Field("hub_port", "hub", "Listen port", "int", 8120, "HUB_PORT", live=False),
+    Field("hub_dir", "hub", "Library folder", "str", "/data/hub", "HUB_DIR",
+          help="Holds models/*.md (guides), skills/ and mcp.json. Re-read every few seconds."),
+    Field("hub_skills_dirs", "hub", "Extra skills folders", "str", "", "HUB_SKILLS_DIRS",
+          help="Comma-separated folders searched for */SKILL.md after <library>/skills."),
+    Field("hub_token", "hub", "API token", "str", "", "HUB_TOKEN",
+          help="When set, clients need Authorization: Bearer <token> (MCP included). "
+               "Write-only: the current value is never shown here."),
     # Dashboard -----------------------------------------------------------------
     Field("dashboard_host", "dashboard", "Listen host", "str", "127.0.0.1", "DASHBOARD_HOST", live=False,
           help="127.0.0.1 keeps the dashboard local. 0.0.0.0 exposes it; set SWITCHYARD_TOKEN if you do."),

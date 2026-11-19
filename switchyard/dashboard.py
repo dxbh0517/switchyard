@@ -35,7 +35,7 @@ from .plugins import discover
 INDEX = (Path(__file__).parent / "static" / "index.html").read_bytes()
 CSRF_HEADER = "X-Switchyard"
 MUTATING = {"/api/settings", "/api/action", "/api/restart"}
-SECRET_KEYS = ("dashboard_token",)
+SECRET_KEYS = ("dashboard_token", "hub_token")
 EXPOSED_NO_TOKEN = (
     "DASHBOARD_HOST is {host} (not loopback) and SWITCHYARD_TOKEN is empty; "
     "anyone who can reach the dashboard can change settings. Set SWITCHYARD_TOKEN, "
@@ -165,6 +165,10 @@ class Dashboard:
         if comp_name == "stt" and action == "reload":
             comp.reload()
             return {"result": "started"}
+        if comp_name == "hub" and action == "rescan":
+            comp.scan(force=True)
+            comp.inventory(refresh=True)
+            return {"result": comp.status()}
         raise ValueError(f"unknown action {comp_name}.{action}")
 
     def make_handler(self):

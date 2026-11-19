@@ -13,7 +13,7 @@ from .events import log
 
 _HELP_EPILOG = """\
 Commands:
-  (none)   Start the arbiter, shim, STT and dashboard
+  (none)   Start the arbiter, shim, STT, hub and dashboard
   ctl      Control a running Switchyard (see `switchyard ctl --help`)
   tray     System tray / menu bar icon (pip install -e ".[tray]")
   update   Check GitHub for a newer version
@@ -23,6 +23,7 @@ Environment:
   ARBITER_ENABLED      Enable the GPU arbiter
   OVMS_SHIM_ENABLED    Enable the OVMS shim
   STT_ENABLED          Enable speech to text
+  HUB_ENABLED          Enable the hub (model guides, skills, MCP gateway)
   DASHBOARD_HOST       Dashboard bind address (default: 127.0.0.1)
   LISTEN_HOST          Bind address for arbiter, OVMS shim, and STT
   SWITCHYARD_URL       Dashboard URL for ctl and tray (default: http://127.0.0.1:8100)
@@ -62,7 +63,7 @@ def serve() -> None:
     settings = Settings()
     analytics.configure(settings)
     log("switchyard", f"v{__version__}, settings file {settings.path}")
-    components: dict = {"arbiter": None, "ovms": None, "stt": None}
+    components: dict = {"arbiter": None, "ovms": None, "stt": None, "hub": None}
     if settings.get("arbiter_enabled"):
         from .arbiter import Arbiter
         components["arbiter"] = Arbiter(settings)
@@ -72,6 +73,9 @@ def serve() -> None:
     if settings.get("stt_enabled"):
         from .stt import Stt
         components["stt"] = Stt(settings)
+    if settings.get("hub_enabled"):
+        from .hub import Hub
+        components["hub"] = Hub(settings)
     for comp in components.values():
         if comp:
             comp.start()
