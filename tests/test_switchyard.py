@@ -684,7 +684,8 @@ class ArbiterSharedTests(unittest.TestCase):
         gate.set()
         for t in (ta, tb, ta2):
             t.join(10)
-        # engine_exit runs after the response is relayed, so the client can return first.
+        # The handler relays the response before engine_exit runs, so the client can
+        # return a moment before inflight is decremented.
         wait_until(lambda: self.arb.state["inflight"] == {"a": 0, "b": 0})
         self.assertEqual(self.arb.state["inflight"], {"a": 0, "b": 0})
 
