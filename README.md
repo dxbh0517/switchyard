@@ -59,7 +59,7 @@ Ports match the default `ENGINES` value (`qwen=127.0.0.1:8002@8000:…,vision=12
 
 ### Docker
 
-Copy [`docker-compose.example.yml`](docker-compose.example.yml) and adjust ports/models, or start from:
+Copy [`docker-compose.example.yml`](docker-compose.example.yml) (Switchyard plus two vLLM engines; walkthrough in [docs/compose-two-engines.md](docs/compose-two-engines.md)) and adjust ports/models, or start from:
 
 ```yaml
 # docker-compose.yml
