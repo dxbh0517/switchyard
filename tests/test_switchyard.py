@@ -686,6 +686,9 @@ class ArbiterSharedTests(unittest.TestCase):
         gate.set()
         for t in (ta, tb, ta2):
             t.join(10)
+        # The handler relays the response before engine_exit runs, so the client can
+        # return a moment before inflight is decremented.
+        wait_until(lambda: self.arb.state["inflight"] == {"a": 0, "b": 0})
         self.assertEqual(self.arb.state["inflight"], {"a": 0, "b": 0})
 
     def test_comfy_cannot_interleave_with_a_draining_switch(self):
