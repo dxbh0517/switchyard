@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import tempfile
 import threading
 import time
@@ -16,6 +15,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
+import _ports
 from switchyard import config
 from switchyard.arbiter import Arbiter
 from switchyard.events import since
@@ -23,9 +23,7 @@ from switchyard.httputil import Server
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return _ports.free_port()
 
 
 def serve(handler) -> tuple[Server, int]:

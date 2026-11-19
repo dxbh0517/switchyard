@@ -17,6 +17,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler
 from unittest.mock import patch
 
+import _ports
 from switchyard.ctl import (
     Client, CtlError, budget_view, format_budget, format_status,
     format_table, main, resolve_base, resolve_token,
@@ -27,9 +28,7 @@ from switchyard import config
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return _ports.free_port()
 
 
 def serve(handler) -> tuple[Server, int]:

@@ -1,6 +1,7 @@
 # Switchyard
 
 [![CI](https://github.com/dxbh0517/switchyard/actions/workflows/ci.yml/badge.svg)](https://github.com/dxbh0517/switchyard/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/dxbh0517/switchyard)](https://github.com/dxbh0517/switchyard/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 

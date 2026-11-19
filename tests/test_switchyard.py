@@ -9,7 +9,6 @@ import contextlib
 import io
 import json
 import os
-import socket
 import tempfile
 import threading
 import time
@@ -19,6 +18,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
+import _ports
 from switchyard import __version__, analytics, config, events
 from switchyard.arbiter import Arbiter, strip_images
 from switchyard.backends import BACKENDS, ComfyBackend, VllmBackend
@@ -31,9 +31,7 @@ from switchyard.stt import Stt, parse_multipart
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return _ports.free_port()
 
 
 def serve(handler) -> tuple[Server, int]:
