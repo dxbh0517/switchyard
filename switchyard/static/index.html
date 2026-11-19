@@ -158,6 +158,7 @@ input.dirty{border-color:var(--amber)}
   <div class="grid2">
     <div class="panel card" id="ovms"></div>
     <div class="panel card" id="stt"></div>
+    <div class="panel card" id="hub"></div>
   </div>
 
   <div class="sec-t">Settings</div>
@@ -301,6 +302,13 @@ function renderStatus(s){
      <div class="stats">${stat("requests", n(t.requests||0))}${stat("audio", fmtDur(Math.round(t.audio_sec||0)))}${stat("speed", t.last_rtf ? t.last_rtf+"× rt" : "—")}${stat("errors", n(t.errors||0))}</div>
      <div class="kv">${esc(t.error || t.model || "")}</div>
      <div class="acts" style="justify-content:flex-start;margin-top:12px"><button data-c="stt" data-a="reload" ${t.state==="loading"?"disabled":""}>Reload model</button></div>`;
+
+  const h = s.hub;
+  $("#hub").innerHTML = !h ? `<div class="card-h"><h3>Hub</h3><span class="chip">disabled</span></div>` :
+    `<div class="card-h"><div><h3>Hub</h3><div class="lane-sub">:${h.port} · MCP at /mcp${h.auth?" · token":""}</div></div><span class="chip ${h.comfy_error?"down":"up"}">${h.comfy_error?"no ComfyUI":"up"}</span></div>
+     <div class="stats">${stat("guides", `${n(h.guides_installed||0)}/${n(h.guides||0)}`)}${stat("skills", n(h.skills||0))}${stat("MCP servers", n(h.mcp_servers||0))}${stat("tool calls", n(h.tool_calls||0))}</div>
+     <div class="kv">${esc(h.comfy_error || `${h.models||0} ComfyUI model files · ${h.dir}`)}</div>
+     <div class="acts" style="justify-content:flex-start;margin-top:12px"><button data-c="hub" data-a="rescan">Rescan</button></div>`;
 }
 document.addEventListener("click", e => {
   const b = e.target.closest("button[data-a]"); if(!b) return;

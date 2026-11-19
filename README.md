@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-Share one NVIDIA GPU between several local AI services without them fighting over VRAM. Built for single-card stacks that are tired of juggling separate proxies. One small Python process with four optional parts:
+Share one NVIDIA GPU between several local AI services without them fighting over VRAM. Built for single-card stacks that are tired of juggling separate proxies. One small Python process with five optional parts:
 
 - **GPU arbiter.** Several [vLLM](https://github.com/vllm-project/vllm) engines and [ComfyUI](https://github.com/Comfy-Org/ComfyUI) share a single NVIDIA GPU. By default only one of them holds the VRAM at a time (vLLM sleep mode or ComfyUI `/free`). Optional shared placement keeps several engines resident while their VRAM costs fit the card.
 - **OVMS shim.** It makes [OpenVINO Model Server](https://github.com/openvinotoolkit/model_server) behave like a standard OpenAI-compatible server:
@@ -14,6 +14,10 @@ Share one NVIDIA GPU between several local AI services without them fighting ove
   - moves stray `</think>` text out of answers
   - maps `/v1` paths to `/v3`
 - **Speech to text.** An OpenAI-compatible `/v1/audio/transcriptions` endpoint on the CPU. It uses Granite Speech CTC models through 🤗 Transformers.
+- **Hub.** Tells clients such as Open WebUI how to use the stack well, all on one port.
+  - Markdown guides for your ComfyUI models: settings that work, how to prompt each model, which LoRAs exist. Each guide is matched against ComfyUI's live model list, and installed files that no guide covers are listed separately.
+  - Shared skills: `SKILL.md` folders.
+  - An MCP endpoint, `/mcp`, with tools over the guides and skills. Shared HTTP MCP servers are proxied at `/mcp/<name>`, so a client only has to configure one host. See [docs/hub.md](docs/hub.md).
 - **Dashboard.** Live status (owner, VRAM, wake/sleep) plus the settings that control the stack: which engines are on, which one loads on boot, and the switching knobs. Localhost only; there is no login.
 
 ![Dashboard](docs/dashboard.png)
@@ -166,6 +170,17 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | `STT_THREADS` | `8` | live | CPU threads per transcription. |
 | `STT_CHUNK_SEC` | `30` | live | Long audio is cut at the quietest point near each boundary. |
 
+**Hub** (off by default; see [docs/hub.md](docs/hub.md))
+
+| Variable | Default | Applies | Description |
+|---|---|---|---|
+| `HUB_ENABLED` | `false` | restart | Turns the hub on or off. |
+| `HUB_HOST` | _(empty)_ | restart | Bind address. Empty means `LISTEN_HOST`. Because the hub proxies MCP servers, bind it narrowly (for example `127.0.0.1` or the docker bridge `172.17.0.1`) or set `HUB_TOKEN`. |
+| `HUB_PORT` | `8120` | restart | Port the hub listens on. |
+| `HUB_DIR` | `/data/hub` | live | Library folder: `models/*.md` (guides), `skills/`, `mcp.json` and `ignore.txt`. Re-read every few seconds. |
+| `HUB_SKILLS_DIRS` | _(empty)_ | live | Extra comma-separated folders searched for `*/SKILL.md`. |
+| `HUB_TOKEN` | _(empty)_ | live | When set, every hub request (MCP included) needs `Authorization: Bearer <token>`. |
+
 **Dashboard**
 
 | Variable | Default | Applies | Description |
@@ -184,6 +199,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | engine ports | `POST /gpu/loading?engine=NAME` | engine startup claim |
 | `OVMS_SHIM_PORT` | `/v1/*`, `/v1/rerank` | OVMS with OpenAI compatibility fixes |
 | `STT_PORT` | `POST /v1/audio/transcriptions`, `GET /v1/models`, `/health` | speech to text |
+| `HUB_PORT` | `POST /mcp`, `/mcp/<name>`, `GET /models`, `/guides[/<slug>]`, `/skills[/<name>[/<file>]]`, `/mcp-servers`, `/search?q=` | hub: MCP server and gateway, model guides, skills |
 | `DASHBOARD_PORT` | `/`, `/api/info`, `/api/status`, `/api/settings`, `/api/plugins`, `/api/action`, `/api/logs`, `/api/history`, `/api/restart` | dashboard |
 
 `GET /api/settings` includes `sections` (Engines, Switching & swapping, Health checks, VRAM probe, Shared VRAM budget) and per-engine `enabled` / `boot`.
