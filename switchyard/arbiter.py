@@ -19,6 +19,13 @@ across the network.
             before each prompt and POST /gpu/release after it.
   Startup : an engine container calls POST /gpu/loading?engine=NAME before `vllm serve`.
             Engine loads are serialized; once an engine is up it is put to sleep.
+  Training: an out-of-band trainer (LoRA, fine-tuning) takes the whole card with a lease:
+            POST /gpu/training/begin?reason=&ttl=  -> {"lease": ID, ...} once every engine
+            sleeps and ComfyUI has unloaded; renew with POST /gpu/training/renew?lease=ID
+            and close with POST /gpu/training/end?lease=ID. Until then chat requests,
+            ComfyUI prompts and engine loads wait. A lease that is not renewed within its
+            ttl expires, so a crashed trainer cannot hold the GPU forever.
+            `switchyard train -- CMD...` wraps all of this around a command.
 
   Health  : a background thread probes vLLM /health and ComfyUI /system_stats without
             holding the arbiter lock. Failed wakes retry with exponential backoff; an
@@ -33,6 +40,7 @@ import http.client
 import json
 import threading
 import time
+import uuid
 from urllib.parse import parse_qs, urlparse
 
 from . import analytics
@@ -48,6 +56,19 @@ INFER_PREFIXES = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "
                   "/v1/audio", "/v1/messages", "/tokenize", "/detokenize")
 IMAGE_PART_TYPES = {"image_url", "input_image", "image", "video_url", "input_video"}
 C = "arbiter"
+
+
+TRAINING_TTL_DEFAULT = 300
+TRAINING_TTL_MIN = 30
+TRAINING_TTL_MAX = 3600
+
+
+class TrainingConflict(RuntimeError):
+    """Another trainer holds (or is waiting for) the GPU."""
+
+
+class LeaseLost(RuntimeError):
+    """The lease is unknown: it ended, expired, or never existed."""
 
 
 class EngineUnavailable(RuntimeError):
@@ -121,6 +142,7 @@ class Arbiter:
             "loading_until": {e: 0.0 for e in names},
             "switching": None,                              # engine name | "comfy" | None
             "evicting": set(),                              # engines being slept
+            "training": None,                               # trainer lease, see training_begin
         }
         self.sleeping: dict = {e: None for e in names}      # cached; occupancy HTTP updates it
         self.health = {e: _blank_health() for e in names}
@@ -424,7 +446,8 @@ class Arbiter:
         with self.cond:
             while True:
                 self._raise_if_unavailable(engine)
-                if st["comfy_active"] or self.loading_engines() or engine in st["evicting"]:
+                if (st["training"] or st["comfy_active"] or self.loading_engines()
+                        or engine in st["evicting"]):
                     self.cond.wait(timeout=5)
                     continue
                 resident = self.sleeping[engine] is False
@@ -488,6 +511,10 @@ class Arbiter:
     def comfy_acquire(self) -> None:
         st = self.state
         with self.cond:
+            # Wait out a trainer before counting this prompt: a pending trainer drains
+            # comfy_active, so counting first would make each wait for the other.
+            while st["training"]:
+                self.cond.wait(timeout=5)
             st["comfy_active"] += 1
             while self.any_inflight() or self.loading_engines() or st["switching"]:
                 self.cond.wait(timeout=5)
@@ -521,7 +548,8 @@ class Arbiter:
             renew = time.time() < st["loading_until"][engine]
             if not renew:
                 while not (not self.loading_engines(engine) and st["comfy_active"] == 0
-                           and not self.any_inflight(engine) and not st["switching"]):
+                           and not self.any_inflight(engine) and not st["switching"]
+                           and not st["training"]):
                     self.cond.wait(timeout=5)
             st["loading_until"][engine] = time.time() + self.s.get("loading_max_sec")
             st["owner"] = None
@@ -535,6 +563,126 @@ class Arbiter:
                 self._end_switch(engine)
         self._emit("load", engine, details={"renew": renew, "free_mb": self.free_mb(engine)})
         self.comfy_unload(self.free_mb(engine), require_idle=not renew)
+
+    # ------------------------------------------------------------ training lease
+    def _lease_locked(self, lease: str | None) -> dict:
+        t = self.state["training"]
+        if not t or (lease is not None and t["lease"] != lease):
+            raise LeaseLost(f"training lease {lease} is not active")
+        return t
+
+    def training_begin(self, reason: str = "", ttl: float | None = None) -> dict:
+        """Give the whole GPU to an out-of-band trainer and return its lease.
+
+        Blocks until in-flight requests, ComfyUI prompts, engine loads and switches
+        finish, then sleeps every awake engine and unloads ComfyUI. New requests queue
+        from the moment this is called, so a busy chat engine cannot starve the trainer.
+        The lease expires `ttl` seconds after the last begin/renew.
+        """
+        ttl = float(ttl or TRAINING_TTL_DEFAULT)
+        ttl = min(max(ttl, TRAINING_TTL_MIN), TRAINING_TTL_MAX)
+        st = self.state
+        lease = uuid.uuid4().hex[:16]
+        with self.cond:
+            if st["training"]:
+                t = st["training"]
+                raise TrainingConflict(
+                    f"GPU is already reserved for training ({t['reason'] or 'no reason given'})")
+            st["training"] = {"lease": lease, "reason": reason, "ttl": ttl, "since": time.time(),
+                              "ready": False, "expires": None}
+            self.cond.notify_all()
+            log(C, f"training requested ({reason or 'no reason given'}); draining the GPU")
+            try:
+                while (self.any_inflight() or self.loading_engines() or st["switching"]
+                       or st["comfy_active"]):
+                    self.cond.wait(timeout=2)
+                    self._lease_locked(lease)  # ended from the dashboard while we waited
+            except LeaseLost:
+                raise
+            except BaseException:
+                if st["training"] and st["training"]["lease"] == lease:
+                    st["training"] = None
+                    self.cond.notify_all()
+                raise
+            victims = [e for e in self.engines if self.sleeping[e] is False]
+            prev = st["owner"]
+            st["owner"] = "training"
+            self._begin_switch("training", victims)
+        t0 = time.time()
+        try:
+            self._sleep_list(victims, "training")
+            self.comfy_unload(0, require_idle=True)
+        finally:
+            with self.cond:
+                self._end_switch("training")
+                t = st["training"]
+                if t and t["lease"] == lease:
+                    t["ready"] = True
+                    t["expires"] = time.time() + ttl
+        free = self.gpu_free_mb()
+        with self.cond:
+            t = self._lease_locked(lease)
+            still_awake = [e for e in self.engines if self.sleeping[e] is False]
+        if still_awake:
+            log(C, f"training: could not sleep {', '.join(still_awake)}", "error")
+        log(C, f"GPU reserved for training ({reason or 'no reason given'}); "
+               f"{'?' if free is None else round(free)} MiB free")
+        self._emit("swap", None, t0=t0, details={"from": prev, "to": "training", "reason": reason,
+                                                 "slept": victims, "free_mb": free})
+        return {"lease": lease, "ttl": ttl, "reason": reason, "slept": victims,
+                "still_awake": still_awake, "free_mb": None if free is None else round(free),
+                "total_mb": self.gpu.get("total_mb")}
+
+    def training_renew(self, lease: str) -> dict:
+        with self.cond:
+            t = self._lease_locked(lease)
+            if t["ready"]:
+                t["expires"] = time.time() + t["ttl"]
+            return {"lease": lease, "ttl": t["ttl"], "expires_in": t["ttl"]}
+
+    def training_end(self, lease: str | None, why: str = "trainer finished") -> dict:
+        """Release the GPU. `lease=None` force-closes whatever lease is open."""
+        with self.cond:
+            t = self._lease_locked(lease)
+            st = self.state
+            st["training"] = None
+            if st["owner"] == "training":
+                st["owner"] = None
+            self.cond.notify_all()
+        took = round(time.time() - t["since"])
+        log(C, f"training lease released after {took}s ({why})", "warn" if lease is None else "info")
+        self._emit("swap", None, details={"from": "training", "to": None, "why": why,
+                                          "held_sec": took})
+        # Engines marked boot come back without waiting for the next request.
+        for e in self.engines:
+            if self.wants_boot(e) and self.unavailable(e) is None:
+                threading.Thread(target=self._safe, args=(lambda e=e: self._warm(e), f"warm {e}"),
+                                 daemon=True).start()
+        return {"released": True, "held_sec": took}
+
+    def _warm(self, engine: str) -> None:
+        self.engine_enter(engine)
+        self.engine_exit(engine)
+
+    def _expire_training(self) -> None:
+        with self.cond:
+            t = self.state["training"]
+            if not (t and t["ready"] and t["expires"] and time.time() > t["expires"]):
+                return
+            lease = t["lease"]
+        try:
+            self.training_end(lease, why=f"lease not renewed for {round(t['ttl'])}s")
+        except LeaseLost:
+            pass
+
+    def _training_view(self) -> dict | None:
+        t = self.state["training"]
+        if not t:
+            return None
+        now = time.time()
+        return {"reason": t["reason"], "ready": t["ready"], "ttl": t["ttl"],
+                "held_sec": round(now - t["since"]),
+                "expires_in": None if not t["expires"] else max(0, round(t["expires"] - now))}
 
     # ------------------------------------------------------------ dashboard actions
     def action(self, name: str, target: str | None) -> str:
@@ -561,8 +709,7 @@ class Arbiter:
                         self._end_switch(target)
         elif name == "warm":
             def run():
-                self.engine_enter(target)
-                self.engine_exit(target)
+                self._warm(target)
         elif name == "comfy_unload":
             def run():
                 with self.cond:
@@ -574,6 +721,9 @@ class Arbiter:
                     if self.state["owner"] == "comfy":
                         self.state["owner"] = None
                     self.cond.notify_all()
+        elif name == "training_end":
+            def run():
+                self.training_end(None, why="released from the dashboard")
         elif name == "comfy_release":
             def run():
                 with self.cond:
@@ -631,6 +781,7 @@ class Arbiter:
                 "placement": "shared" if self.shared() else "exclusive",
                 "resident": resident,
                 "switching": st["switching"],
+                "training": self._training_view(),
                 "budget": {
                     "total_mb": int(self.s.get("vram_budget_mb") or 0) or self.gpu.get("total_mb"),
                     "safety_mb": self.s.get("vram_safety_mb"),
@@ -643,6 +794,7 @@ class Arbiter:
         stale_since = None
         while True:
             time.sleep(10)
+            self._expire_training()
             with self.cond:
                 comfy_active = self.state["comfy_active"]
                 busy = self.any_inflight()
@@ -692,7 +844,8 @@ class Arbiter:
         with self.cond:
             self.state["loading_until"][engine] = 0.0
             busy = self.state["owner"] == engine or self.state["inflight"][engine]
-            boot = self.wants_boot(engine)
+            # A trainer owns the card: park the engine instead of waking it.
+            boot = self.wants_boot(engine) and not self.state["training"]
             self.cond.notify_all()
         if busy:
             return
@@ -785,9 +938,33 @@ class Arbiter:
                     else:
                         arb.engine_loading(name)
                         self.send_json(200, {"loading": name, "max_sec": arb.s.get("loading_max_sec")})
+                elif p.startswith("/gpu/training/") and self.command == "POST":
+                    self._training_api(p.rsplit("/", 1)[1], parse_qs(u.query))
                 else:
                     return False
                 return True
+
+            def _training_api(self, op: str, qs: dict) -> None:
+                def q(name):
+                    return (qs.get(name) or [""])[0]
+                try:
+                    if op == "begin":
+                        try:
+                            ttl = float(q("ttl") or TRAINING_TTL_DEFAULT)
+                        except ValueError:
+                            self.send_json(400, {"error": "ttl must be a number"})
+                            return
+                        self.send_json(200, arb.training_begin(q("reason")[:200], ttl))
+                    elif op == "renew":
+                        self.send_json(200, arb.training_renew(q("lease")))
+                    elif op == "end":
+                        self.send_json(200, arb.training_end(q("lease")))
+                    else:
+                        self.send_json(404, {"error": f"unknown training op {op}"})
+                except TrainingConflict as e:
+                    self.send_json(409, {"error": str(e), "training": arb._training_view()})
+                except LeaseLost as e:
+                    self.send_json(410, {"error": str(e)})
 
             def proxy(self) -> None:
                 body = self.body() or None

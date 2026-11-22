@@ -27,6 +27,7 @@ ACTION = {
     "sleep": ("sleep", True),
     "unload": ("sleep", True),
     "comfy-unload": ("comfy_unload", False),
+    "training-end": ("training_end", False),
 }
 
 
@@ -233,6 +234,11 @@ def format_status(status: dict) -> str:
         lines.append(f"     {extra}")
     owner = a.get("owner")
     lines.append(f"Owner  {owner}" if owner else "Owner  (idle)")
+    training = a.get("training")
+    if isinstance(training, dict):
+        state = "holding the GPU" if training.get("ready") else "waiting for the GPU"
+        lines.append(f"Training  {state}: {training.get('reason') or '-'} "
+                     f"(held {training.get('held_sec')}s, expires in {training.get('expires_in')}s)")
     lines.append("")
     lines.append(format_engines(a))
     return "\n".join(lines)
@@ -328,7 +334,7 @@ def run(args: argparse.Namespace) -> None:
             raise CtlError(f"{cmd} does not take an engine name")
         result = client.action(name, args.engine if needs else None)
         payload = {"action": name, "target": args.engine if needs else None, **result}
-        who = args.engine or "ComfyUI"
+        who = args.engine or ("trainer" if cmd == "training-end" else "ComfyUI")
         _emit(args.json, payload, f"{cmd} {who}: {_cell(result.get('result'))}")
         return
     if args.engine:
@@ -360,6 +366,7 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
   sleep|unload ENGINE put an engine to sleep
   swap ENGINE         give the GPU to an engine (same as wake)
   comfy-unload        unload ComfyUI models from VRAM
+  training-end        force-release a GPU reservation held by `switchyard train`
   budget              memory / VRAM numbers the server exposes today
 
 Environment: SWITCHYARD_URL (default http://127.0.0.1:8100), SWITCHYARD_TOKEN
@@ -371,7 +378,7 @@ Environment: SWITCHYARD_URL (default http://127.0.0.1:8100), SWITCHYARD_TOKEN
     p.add_argument("--token", default=None, help="Bearer token (env SWITCHYARD_TOKEN)")
     p.add_argument("--json", action="store_true", help="print JSON instead of a table")
     p.add_argument("command", choices=[
-        "status", "engines", "wake", "load", "sleep", "unload", "swap", "comfy-unload", "budget",
+        "status", "engines", "wake", "load", "sleep", "unload", "swap", "comfy-unload", "training-end", "budget",
     ], help="command to run")
     p.add_argument("engine", nargs="?", help="engine name for wake/sleep/swap")
     return p

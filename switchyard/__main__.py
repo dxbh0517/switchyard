@@ -15,6 +15,7 @@ _HELP_EPILOG = """\
 Commands:
   (none)   Start the arbiter, shim, STT, hub and dashboard
   ctl      Control a running Switchyard (see `switchyard ctl --help`)
+  train    Reserve the whole GPU for a trainer: `switchyard train -- python run.py cfg.yml`
   tray     System tray / menu bar icon (pip install -e ".[tray]")
   update   Check GitHub for a newer version
 
@@ -48,6 +49,7 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
     # `ctl` is dispatched before parsing (it has its own parser); listed here for --help.
     sub.add_parser("ctl", help="control a running Switchyard over its dashboard API", add_help=False)
+    sub.add_parser("train", help="reserve the whole GPU, run a trainer, release it", add_help=False)
     tray = sub.add_parser("tray", help="system tray / menu bar (needs the [tray] extra)")
     tray.add_argument("--url", default=None,
                       help="dashboard URL (default: SWITCHYARD_URL or http://127.0.0.1:8100)")
@@ -90,6 +92,9 @@ def main(argv: list[str] | None = None) -> None:
     if argv and argv[0] == "ctl":
         from .ctl import main as ctl_main
         raise SystemExit(ctl_main(argv[1:], prog="switchyard ctl"))
+    if argv and argv[0] == "train":
+        from .train import main as train_main
+        raise SystemExit(train_main(argv[1:]))
     args = _parser().parse_args(argv)
     if args.command == "tray":
         from .tray import run

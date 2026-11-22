@@ -54,6 +54,7 @@ Ports match the default `ENGINES` value (`qwen=127.0.0.1:8002@8000:…,vision=12
   - Level 2 drops the weights and reloads them from disk (the page cache when warm). Each sleeping engine keeps under 1 GiB of VRAM.
   - Level 1 keeps the weights in CPU RAM instead.
 - **ComfyUI jobs:** the hook in [`comfyui_node/`](comfyui_node/gpu_arbiter) calls `/gpu/acquire` before each prompt and `/gpu/release` after it. If Switchyard can't be reached, ComfyUI runs normally.
+- **Training (LoRA, fine-tuning):** run the trainer as `switchyard train -- python run.py job.yml`. Switchyard waits for running chat and ComfyUI work, sleeps every engine, unloads ComfyUI, and gives the trainer the whole card. Chat requests, ComfyUI prompts and engine loads wait until the command exits. The wrapper renews a lease while the trainer runs; if the wrapper is killed, the lease expires after `--ttl` seconds (default 300). `switchyard ctl training-end` force-releases a stuck reservation.
 - **Engine startup:** an engine container calls `POST /gpu/loading?engine=NAME` before it starts `vllm serve`. Loads are serialized. Engines marked **boot** in the dashboard (or `:boot` in `ENGINES`) are woken once they are up; the rest stay parked until a request or a manual Wake.
 - **Availability:** an engine with **On** unchecked (or `:off` in `ENGINES`) is not bound and is not woken. Apply that change with a restart.
 - **Text-only engines:** image parts in requests to a text-only engine are replaced with a short note, so the request doesn't fail with HTTP 400.
@@ -197,6 +198,7 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | engine ports | `GET /gpu/status` | arbiter state as JSON |
 | engine ports | `POST /gpu/acquire`, `/gpu/release` | ComfyUI hook |
 | engine ports | `POST /gpu/loading?engine=NAME` | engine startup claim |
+| engine ports | `POST /gpu/training/begin?reason=&ttl=`, `/gpu/training/renew?lease=`, `/gpu/training/end?lease=` | whole-GPU lease for a trainer |
 | `OVMS_SHIM_PORT` | `/v1/*`, `/v1/rerank` | OVMS with OpenAI compatibility fixes |
 | `STT_PORT` | `POST /v1/audio/transcriptions`, `GET /v1/models`, `/health` | speech to text |
 | `HUB_PORT` | `POST /mcp`, `/mcp/<name>`, `GET /models`, `/guides[/<slug>]`, `/skills[/<name>[/<file>]]`, `/mcp-servers`, `/search?q=` | hub: MCP server and gateway, model guides, skills |
