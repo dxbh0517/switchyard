@@ -49,6 +49,7 @@ Ports match the default `ENGINES` value (`qwen=127.0.0.1:8002@8000:…,vision=12
 
 - **When a request arrives:** In the default exclusive mode, Switchyard waits for any ComfyUI job and for other engines' requests to finish, puts the current owner to sleep or asks ComfyUI to unload, then wakes the requested engine and forwards the request. Responses are streamed, so SSE works.
 - **Shared VRAM (`SHARED_VRAM=true`):** engines that already fit stay awake and serve in parallel. A wake that would exceed the card budget minus `VRAM_SAFETY_MB` waits only for the least-recently used victim's in-flight requests, then evicts it. Occupancy HTTP (sleep/wake/ComfyUI) does not hold the arbiter lock. ComfyUI still takes the whole GPU for a prompt. If the budget is unknown (no `VRAM_BUDGET_MB` and the VRAM probe has no total), shared mode falls back to exclusive eviction.
+- **System reserve:** `RAM_RESERVE_MB` (default 4 GiB) and `VRAM_RESERVE_MB` (default 0) keep memory back for the OS and desktop, so a long-running model doesn't push the rest of the machine into swap. Level-1 sleeps that would break the RAM reserve become level 2, and an idle ComfyUI is unloaded when RAM runs low. The dashboard shows available RAM and memory stall time (Linux PSI).
 - **After `IDLE_SLEEP_SEC` without traffic:** that engine goes back to sleep, and the VRAM is free for whatever comes next.
 - **Sleep levels:**
   - Level 2 drops the weights and reloads them from disk (the page cache when warm). Each sleeping engine keeps under 1 GiB of VRAM.
@@ -149,6 +150,8 @@ Settings come from three places. A value saved in the dashboard (written to `/da
 | `SHARED_VRAM` | `false` | live | Off: one occupant (today's behavior). On: keep several engines resident while they fit the budget; those engines serve in parallel. |
 | `VRAM_BUDGET_MB` | `0` | live | Card size in MiB for shared placement. `0` = use the total from the VRAM probe (`GPU_PROBE`). |
 | `VRAM_SAFETY_MB` | `1024` | live | Headroom subtracted from the budget so a wake does not OOM. |
+| `VRAM_RESERVE_MB` | `0` | live | VRAM kept free for the desktop. A wake asks ComfyUI to unload until the engine's need plus this is free; shared placement packs into the budget minus this; a warning is logged when a woken engine leaves less (vLLM still takes its `--gpu-memory-utilization` share). |
+| `RAM_RESERVE_MB` | `4096` | live | Host RAM kept available for the OS. Sleep level 1 falls back to level 2 when backing weights up to RAM would eat into it; when available RAM stays below it, an idle ComfyUI is told to drop its cached models. `0` disables. |
 
 **OVMS shim**
 

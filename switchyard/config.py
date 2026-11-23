@@ -46,6 +46,7 @@ SECTIONS = {
     "health": "Health checks",
     "vram": "VRAM probe",
     "budget": "Shared VRAM budget",
+    "reserve": "System reserve",
 }
 
 FIELDS: list[Field] = [
@@ -109,6 +110,17 @@ FIELDS: list[Field] = [
           help="Headroom left unused so a wake or a ComfyUI prompt does not OOM. "
                "Usable budget is vram_budget_mb minus this.",
           section="budget"),
+    Field("vram_reserve_mb", "arbiter", "Keep VRAM free (MiB)", "int", 0, "VRAM_RESERVE_MB", min=0,
+          help="VRAM left for the desktop and other GPU apps. A wake asks ComfyUI to unload until "
+               "this much is free on top of the engine's need, shared placement packs engines into "
+               "the budget minus this, and a warning is logged when a woken engine leaves less. "
+               "vLLM still takes its --gpu-memory-utilization share, so size that to match.",
+          section="reserve"),
+    Field("ram_reserve_mb", "arbiter", "Keep RAM free (MiB)", "int", 4096, "RAM_RESERVE_MB", min=0,
+          help="Host RAM kept available for the OS. Sleep level 1 falls back to level 2 when "
+               "backing the weights up to RAM would eat into it, and when available RAM drops "
+               "below it an idle ComfyUI is told to drop its cached models. 0 disables.",
+          section="reserve"),
     # OVMS shim -----------------------------------------------------------------
     Field("ovms_enabled", "ovms", "Enabled", "bool", True, "OVMS_SHIM_ENABLED", live=False),
     Field("ovms_port", "ovms", "Listen port", "int", 8012, "OVMS_SHIM_PORT", live=False),

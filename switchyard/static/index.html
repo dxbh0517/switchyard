@@ -47,6 +47,7 @@ h1{font-size:18px;margin:0;letter-spacing:-.01em;font-weight:650}
 .gpu-owner{color:var(--ink-2);font-size:13px;margin-top:2px}
 .gpu-owner b{color:var(--ink);font-weight:600}
 .vram{font-family:var(--mono);font-size:12.5px;color:var(--ink-2)}
+#gram{text-align:right;margin-top:2px}
 .bar{height:8px;border-radius:99px;background:var(--line-2);margin:12px 0 6px;overflow:hidden}
 .bar>i{display:block;height:100%;width:0;background:var(--accent);border-radius:99px;transition:width .6s cubic-bezier(.2,.8,.2,1)}
 .lanes{border-top:1px solid var(--line);margin-top:16px}
@@ -148,7 +149,7 @@ input.dirty{border-color:var(--amber)}
   <div class="panel gpu" id="gpu">
     <div class="gpu-top">
       <div><div class="gpu-name" id="gname">GPU</div><div class="gpu-owner" id="gowner">Waiting for status…</div></div>
-      <div class="vram" id="gvram"></div>
+      <div><div class="vram" id="gvram"></div><div class="vram" id="gram"></div></div>
     </div>
     <div class="bar"><i id="gbar"></i></div>
     <div class="lanes" id="lanes"></div>
@@ -262,6 +263,17 @@ function renderStatus(s){
     } else {
       $("#gvram").textContent = g.source === "off" ? "VRAM probe off" : "VRAM unknown";
       $("#gbar").style.width = "0";
+    }
+    const r = a.reserve || {};
+    if(r.ram_available_mb != null){
+      const p = r.memory_pressure && r.memory_pressure.full_avg10;
+      $("#gram").textContent = `RAM ${(r.ram_available_mb/1024).toFixed(1)} GiB free`
+        + (r.ram_mb ? ` · keep ${(r.ram_mb/1024).toFixed(1)}` : "")
+        + (p ? ` · stalled ${p.toFixed(0)}%` : "");
+      $("#gram").style.color = r.ram_low ? "var(--red)" : "";
+      $("#gram").title = "Host RAM available to the OS. Below the reserve, an idle ComfyUI is unloaded and sleep level 1 falls back to 2.";
+    } else {
+      $("#gram").textContent = "";
     }
 
     let html = "";

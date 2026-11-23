@@ -45,6 +45,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import analytics
 from .backends import ComfyBackend, VllmBackend
+from . import reserve
 from .budget import lru_victims, resolve_cost, usable_mb
 from .config import Settings
 from .estimate import estimate_from_engine
@@ -155,6 +156,9 @@ class Arbiter:
         self.comfy_queue: dict = {"running": None, "pending": None}
         self.stats = {e: Counters() for e in names}
         self.servers: list = []
+        self.ram: dict = {"total_mb": None, "available_mb": None}  # host RAM, refreshed by ram_guard
+        self.psi: dict | None = None                        # memory pressure (PSI), Linux only
+        self.ram_low_since: float | None = None
 
     # ------------------------------------------------------------ settings
     def shared(self) -> bool:
@@ -199,7 +203,17 @@ class Arbiter:
 
     def usable(self) -> int | None:
         budget = int(self.s.get("vram_budget_mb") or 0) or self.gpu.get("total_mb")
-        return usable_mb(budget, self.s.get("vram_safety_mb"))
+        return usable_mb(budget, int(self.s.get("vram_safety_mb") or 0) + self.vram_reserve())
+
+    def vram_reserve(self) -> int:
+        return int(self.s.get("vram_reserve_mb") or 0)
+
+    def ram_reserve(self) -> int:
+        return int(self.s.get("ram_reserve_mb") or 0)
+
+    def wake_target_mb(self, engine: str) -> int:
+        """Free VRAM to wait for before waking: the engine's need plus the desktop reserve."""
+        return self.free_mb(engine) + self.vram_reserve()
 
     # ------------------------------------------------------------ helpers
     def any_inflight(self, exclude: str | None = None) -> bool:
@@ -330,7 +344,7 @@ class Arbiter:
 
     def sleep(self, engine: str, reason: str) -> None:
         if self.sleeping[engine] is False:
-            level = self.s.get("sleep_level")
+            level = self.sleep_level_for(engine)
             log(C, f"sleeping {engine} level={level} ({reason})")
             t, vram_b, ram_b = time.time(), self.vram_used_mb(), analytics.ram_used_mb()
             try:
@@ -346,6 +360,21 @@ class Arbiter:
                        details={"level": level, "reason": reason})
         self.sleeping[engine] = True
 
+    def sleep_level_for(self, engine: str) -> int:
+        """The configured level, or 2 when a level-1 RAM backup would eat the RAM reserve."""
+        level = self.s.get("sleep_level")
+        if level != 1:
+            return level
+        mem = reserve.meminfo()
+        avail = mem and mem["available_mb"]
+        backup = self.cost_mb(engine)
+        if reserve.level1_fits(avail, backup, self.ram_reserve()):
+            return 1
+        log(C, f"{engine}: sleeping at level 2 instead of 1; backing ~{backup} MiB up to RAM "
+               f"would leave {avail - backup} MiB, below the {self.ram_reserve()} MiB RAM reserve",
+            "warn")
+        return 2
+
     def _sleep_list(self, engines: list[str], reason: str) -> None:
         for e in engines:
             try:
@@ -357,7 +386,7 @@ class Arbiter:
         while self.comfy_running():
             time.sleep(0.5)
         self._sleep_list(victims, reason)
-        target = self.free_mb(engine)
+        target = self.wake_target_mb(engine)
         if unload_comfy:
             self.comfy_unload(target)
         attempts = self.s.get("wake_attempts")
@@ -369,6 +398,7 @@ class Arbiter:
                     log(C, f"waking {engine} with VRAM unknown", "warn")
                 self.wake(engine)
                 self._note_measured(engine, before)
+                self._check_vram_reserve(engine)
                 return
             except Exception as e:
                 log(C, f"wake {engine} failed (attempt {attempt}/{attempts}): {e}", "error")
@@ -382,6 +412,14 @@ class Arbiter:
                 self.comfy_unload(target)
                 time.sleep(delay)
                 delay *= 2
+
+    def _check_vram_reserve(self, engine: str) -> None:
+        """Warn when a woken engine leaves less VRAM free than the desktop reserve."""
+        want = self.vram_reserve()
+        free = self.gpu.get("free_mb")
+        if want and free is not None and free < want:
+            log(C, f"{engine} left {round(free)} MiB VRAM free, below the {want} MiB reserve; "
+                   f"lower its --gpu-memory-utilization or KV cache size", "warn")
 
     def _note_measured(self, engine: str, before: float | None) -> None:
         after = self.gpu_free_mb()
@@ -562,7 +600,7 @@ class Arbiter:
             with self.cond:
                 self._end_switch(engine)
         self._emit("load", engine, details={"renew": renew, "free_mb": self.free_mb(engine)})
-        self.comfy_unload(self.free_mb(engine), require_idle=not renew)
+        self.comfy_unload(self.wake_target_mb(engine), require_idle=not renew)
 
     # ------------------------------------------------------------ training lease
     def _lease_locked(self, lease: str | None) -> dict:
@@ -787,6 +825,14 @@ class Arbiter:
                     "safety_mb": self.s.get("vram_safety_mb"),
                     "usable_mb": room,
                     "resident_mb": sum(self.cost_mb(e) for e in resident),
+                },
+                "reserve": {
+                    "vram_mb": self.vram_reserve(),
+                    "ram_mb": self.ram_reserve(),
+                    "ram_total_mb": self.ram.get("total_mb"),
+                    "ram_available_mb": self.ram.get("available_mb"),
+                    "ram_low": reserve.ram_low(self.ram.get("available_mb"), self.ram_reserve()),
+                    "memory_pressure": self.psi,
                 }}
 
     # ------------------------------------------------------------ background threads
@@ -896,6 +942,45 @@ class Arbiter:
             self.gpu_free_mb()
             self.comfy_running()
             time.sleep(3)
+
+    def ram_guard(self, interval: float = 5.0, grace: float = 10.0, cooldown: float = 120.0) -> None:
+        """Keep host RAM above the reserve: unload an idle ComfyUI, warn about level-1 backups."""
+        last_action = 0.0
+        while True:
+            try:
+                last_action = self.check_ram(grace, cooldown, last_action)
+            except Exception as e:
+                log(C, f"RAM guard failed: {e}", "error")
+            time.sleep(interval)
+
+    def check_ram(self, grace: float, cooldown: float, last_action: float) -> float:
+        """One RAM guard pass. Returns the time of the last relief action."""
+        self.ram = reserve.meminfo() or {"total_mb": None, "available_mb": None}
+        self.psi = reserve.memory_pressure()
+        want, avail = self.ram_reserve(), self.ram.get("available_mb")
+        now = time.time()
+        if not reserve.ram_low(avail, want):
+            self.ram_low_since = None
+            return last_action
+        self.ram_low_since = self.ram_low_since or now
+        if now - self.ram_low_since < grace or now - last_action < cooldown:
+            return last_action
+        full = (self.psi or {}).get("full_avg10")
+        stall = f", memory stall {full:.0f}%" if full is not None else ""
+        log(C, f"RAM low: {avail} MiB available, reserve {want} MiB{stall}", "warn")
+        with self.cond:
+            comfy_busy = self.state["comfy_active"] or self.state["owner"] == "comfy"
+            level1 = [e for e in self.engines
+                      if self.sleeping[e] and self.state["sleep_level"][e] == 1]
+        if level1:
+            log(C, f"{', '.join(level1)} asleep at level 1 hold weights in RAM; "
+                   f"set Sleep level to 2 to free it", "warn")
+        if not comfy_busy and self.comfy_running() is False:
+            t, ram_b = time.time(), analytics.ram_used_mb()
+            result = self.comfy.unload(0)
+            self._emit("unload", "comfy", t0=t, vram_before=self.vram_used_mb(), ram_before=ram_b,
+                       details={"reason": "ram_reserve", "available_mb": avail, **result})
+        return now
 
     def health_monitor(self) -> None:
         """Probe engines and ComfyUI. HTTP runs outside `self.cond`."""
@@ -1029,7 +1114,7 @@ class Arbiter:
             boot = "boot" if cfg.get("boot") else "parked"
             log(C, f"{e}: {host}:{cfg['listen']} -> {cfg['backend']} "
                    f"(wake needs {cfg['free_mb']} MiB free, {mode}, {boot})")
-        for target in (self.idle_watcher, self.poller, self.health_monitor):
+        for target in (self.idle_watcher, self.poller, self.health_monitor, self.ram_guard):
             threading.Thread(target=target, daemon=True).start()
         for e, cfg in self.engines.items():
             threading.Thread(target=self.startup_watcher, args=(e,), daemon=True).start()
